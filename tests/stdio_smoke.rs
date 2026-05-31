@@ -129,3 +129,63 @@ fn read_frame<R: BufRead>(reader: &mut R) -> Value {
         panic!("invalid JSON frame: {error}; raw: {line}");
     })
 }
+
+#[test]
+fn stdio_accepts_pretty_printed_multi_line_frame() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(binary_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn plugin");
+
+    let stdin = child.stdin.as_mut().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    // 1. initialize sent as a pretty-printed multi-line JSON-RPC frame
+    //    (no trailing newline mid-frame; the streaming reader must accept it).
+    let init_frame = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocol_version": "1.1.0",
+            "host_info": { "name": "animus", "version": "0.5.0" },
+            "capabilities": {},
+            "init_extensions": {
+                "project_binding": {
+                    "project_root": temp.path().to_string_lossy()
+                }
+            }
+        }
+    });
+    let pretty = serde_json::to_string_pretty(&init_frame).expect("pretty json");
+    assert!(
+        pretty.contains('\n'),
+        "expected pretty-printed frame to be multi-line"
+    );
+    stdin.write_all(pretty.as_bytes()).expect("write pretty");
+    stdin.flush().expect("flush pretty");
+
+    let init_response = read_frame(&mut reader);
+    assert_eq!(init_response["id"], 1);
+    assert!(init_response["result"]["protocol_version"].is_string());
+
+    // 2. follow-up `$/ping` as a second pretty-printed frame to confirm the
+    //    reader peels off back-to-back multi-line frames cleanly.
+    let ping_frame = json!({ "jsonrpc": "2.0", "id": 2, "method": "$/ping" });
+    let pretty_ping = serde_json::to_string_pretty(&ping_frame).expect("pretty ping");
+    stdin.write_all(pretty_ping.as_bytes()).expect("write ping");
+    stdin.flush().expect("flush ping");
+
+    let ping_response = read_frame(&mut reader);
+    assert_eq!(ping_response["id"], 2);
+    assert_eq!(ping_response["result"], json!({}));
+
+    let exit_frame = json!({ "jsonrpc": "2.0", "id": 3, "method": "exit" });
+    let _ = writeln!(stdin, "{exit_frame}");
+    let _ = stdin.flush();
+    let _ = child.wait();
+}

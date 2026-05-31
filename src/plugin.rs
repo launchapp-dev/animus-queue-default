@@ -22,7 +22,7 @@ use animus_queue_protocol::{
 };
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::queue_service::{QueueBackend, QueueLeaseError};
@@ -47,31 +47,67 @@ pub async fn run() -> Result<()> {
     let backend: Arc<RwLock<Option<QueueBackend>>> = Arc::new(RwLock::new(None));
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
 
-    let stdin = tokio::io::stdin();
-    // TODO(codex-p2): the stdio frame reader assumes one JSON-RPC frame per
-    // line, consistent with the `animus-plugin-protocol` "newline-delimited
-    // JSON-RPC 2.0 over stdio" wire convention and the reference
-    // `animus-plugin-runtime` upstream. If a host ever ships pretty-printed
-    // (multi-line) frames we will need a streaming serde deserializer here.
-    let mut reader = BufReader::new(stdin).lines();
-    while let Some(line) = reader.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let mut stdin = tokio::io::stdin();
+    // Streaming JSON-RPC frame reader. Reads raw bytes into a buffer and
+    // peels off complete JSON values with `serde_json::Deserializer`,
+    // independent of newline framing. This accepts both the canonical
+    // NDJSON wire form and pretty-printed (multi-line) frames.
+    let mut buffer: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stdin.read(&mut chunk).await?;
+        if n == 0 {
+            break;
         }
-        let request: RpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(error) => {
-                tracing::warn!(plugin = PLUGIN_NAME, %error, "invalid JSON-RPC frame");
-                continue;
-            }
-        };
+        buffer.extend_from_slice(&chunk[..n]);
 
-        let backend = backend.clone();
-        let stdout = stdout.clone();
-        tokio::spawn(async move {
-            handle_request(request, backend, stdout).await;
-        });
+        loop {
+            // Skip leading whitespace before attempting to deserialize.
+            let leading_ws = buffer
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            if leading_ws > 0 {
+                buffer.drain(..leading_ws);
+            }
+            if buffer.is_empty() {
+                break;
+            }
+
+            let mut stream =
+                serde_json::Deserializer::from_slice(&buffer).into_iter::<RpcRequest>();
+            match stream.next() {
+                Some(Ok(request)) => {
+                    let consumed = stream.byte_offset();
+                    drop(stream);
+                    buffer.drain(..consumed);
+                    let backend = backend.clone();
+                    let stdout = stdout.clone();
+                    tokio::spawn(async move {
+                        handle_request(request, backend, stdout).await;
+                    });
+                }
+                Some(Err(error)) if error.is_eof() => {
+                    // Need more bytes for the current frame.
+                    break;
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(plugin = PLUGIN_NAME, %error, "invalid JSON-RPC frame");
+                    // Recover by discarding bytes up to the next newline so we
+                    // can keep parsing any valid frames that arrived in the
+                    // same read. If no newline is in sight, wait for more
+                    // bytes — clearing the buffer here would drop unread
+                    // partial frames the host may complete on the next write.
+                    if let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                        buffer.drain(..=pos);
+                        // Loop to attempt parsing any remaining buffered frames.
+                        continue;
+                    }
+                    break;
+                }
+                None => break,
+            }
+        }
     }
     Ok(())
 }
