@@ -1,6 +1,8 @@
 //! Integration tests for the new `queue/lease` atomic dispatch path.
 
-use animus_queue_default::queue_service::{QueueBackend, QueueLeaseError};
+use animus_queue_default::queue_service::{
+    QueueBackend, QueueLeaseError, QueueReleasePendingError,
+};
 use animus_subject_protocol::{SubjectDispatch, SubjectRef};
 use chrono::Utc;
 
@@ -213,4 +215,152 @@ fn lease_skips_held_entries() {
     let leased = backend.lease(5, None).expect("lease 5");
     assert_eq!(leased.leased.len(), 1);
     assert_eq!(leased.leased[0].entry_id, two.entry_id);
+}
+
+#[test]
+fn release_pending_returns_assigned_entry_to_pending() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let enqueued = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue");
+    let leased = backend
+        .lease(1, Some(vec!["wf-1".to_string()]))
+        .expect("lease");
+    assert_eq!(leased.leased.len(), 1);
+    assert_eq!(leased.leased[0].entry_id, enqueued.entry_id);
+
+    let response = backend
+        .release_pending(&enqueued.entry_id, "operator-cancel")
+        .expect("release_pending");
+    assert_eq!(response.entry_id, enqueued.entry_id);
+    assert_eq!(response.status, "pending");
+
+    // Lease fields cleared, entry back in pending.
+    let listing = backend.list(&[], None, None).expect("list");
+    assert_eq!(listing.stats.total, 1);
+    assert_eq!(listing.stats.pending, 1);
+    assert_eq!(listing.stats.assigned, 0);
+    let entry = &listing.entries[0];
+    assert_eq!(entry.entry_id, enqueued.entry_id);
+    assert_eq!(entry.status, "pending");
+    assert!(
+        entry.workflow_id.is_none(),
+        "workflow_id should be cleared after release_pending, got {:?}",
+        entry.workflow_id
+    );
+    assert!(
+        entry.assigned_at.is_none(),
+        "assigned_at should be cleared after release_pending, got {:?}",
+        entry.assigned_at
+    );
+}
+
+#[test]
+fn release_pending_on_pending_entry_returns_not_assigned() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let enqueued = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue");
+
+    let result = backend.release_pending(&enqueued.entry_id, "no-op");
+    match result {
+        Err(QueueReleasePendingError::NotAssigned {
+            entry_id,
+            actual_state,
+        }) => {
+            assert_eq!(entry_id, enqueued.entry_id);
+            assert_eq!(actual_state, "pending");
+        }
+        other => panic!("expected NotAssigned, got {other:?}"),
+    }
+
+    // State unchanged.
+    let listing = backend.list(&[], None, None).expect("list");
+    assert_eq!(listing.stats.total, 1);
+    assert_eq!(listing.stats.pending, 1);
+    assert_eq!(listing.stats.assigned, 0);
+}
+
+#[test]
+fn release_pending_on_held_entry_returns_not_assigned_with_actual_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let enqueued = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue");
+    backend.hold(&enqueued.entry_id).expect("hold");
+
+    let result = backend.release_pending(&enqueued.entry_id, "operator-cancel");
+    match result {
+        Err(QueueReleasePendingError::NotAssigned {
+            entry_id,
+            actual_state,
+        }) => {
+            assert_eq!(entry_id, enqueued.entry_id);
+            assert_eq!(actual_state, "held");
+        }
+        other => panic!("expected NotAssigned with actual='held', got {other:?}"),
+    }
+}
+
+#[test]
+fn release_pending_on_unknown_entry_returns_not_found() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue");
+
+    let result = backend.release_pending("does-not-exist", "operator-cancel");
+    match result {
+        Err(QueueReleasePendingError::NotFound { entry_id }) => {
+            assert_eq!(entry_id, "does-not-exist");
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn release_pending_then_release_to_new_holder_succeeds() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let enqueued = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue");
+
+    // First holder leases.
+    let first_lease = backend
+        .lease(1, Some(vec!["wf-original".to_string()]))
+        .expect("first lease");
+    assert_eq!(first_lease.leased.len(), 1);
+    assert_eq!(
+        first_lease.leased[0].workflow_id.as_deref(),
+        Some("wf-original")
+    );
+
+    // Release back to pending under audit reason.
+    backend
+        .release_pending(&enqueued.entry_id, "preempted-by-operator")
+        .expect("release_pending");
+
+    // A second lease attempt picks the same entry up for a new holder.
+    let second_lease = backend
+        .lease(1, Some(vec!["wf-replacement".to_string()]))
+        .expect("second lease");
+    assert_eq!(second_lease.leased.len(), 1);
+    assert_eq!(second_lease.leased[0].entry_id, enqueued.entry_id);
+    assert_eq!(
+        second_lease.leased[0].workflow_id.as_deref(),
+        Some("wf-replacement"),
+        "new lease holder must overwrite the previous workflow_id"
+    );
+    assert_eq!(second_lease.leased[0].status, "assigned");
+
+    // No phantom Pending row left behind: exactly one assigned, zero pending.
+    let listing = backend.list(&[], None, None).expect("list");
+    assert_eq!(listing.stats.total, 1);
+    assert_eq!(listing.stats.assigned, 1);
+    assert_eq!(listing.stats.pending, 0);
 }

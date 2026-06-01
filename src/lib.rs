@@ -23,7 +23,9 @@ pub mod dispatch_queue_store;
 pub mod plugin;
 pub mod queue_service;
 
-pub use dispatch_queue_state::{DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState};
+pub use dispatch_queue_state::{
+    DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+};
 pub use dispatch_queue_store::{
     load_queue_state, queue_lock_path, queue_state_path, save_queue_state,
 };

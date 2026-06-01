@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 
 use animus_queue_protocol::{
     completion_status, status, QueueEntry, QueueLeaseResponse, QueueListResponse,
-    QueueMutationResponse, QueueReorderResponse, QueueStats,
+    QueueMutationResponse, QueueReleasePendingResponse, QueueReorderResponse, QueueStats,
 };
 use animus_subject_protocol::SubjectDispatch;
 use anyhow::Result;
 use chrono::Utc;
 
 use crate::dispatch_queue_state::{
-    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+    DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state, save_queue_state};
 
@@ -448,6 +448,71 @@ impl QueueBackend {
     }
 
     // ============================================================
+    // queue/release_pending
+    // ============================================================
+
+    /// Atomically return an Assigned entry to Pending. Clears the workflow
+    /// lease fields and appends an audit entry describing why.
+    ///
+    /// Errors:
+    /// - [`QueueReleasePendingError::NotFound`] when `entry_id` is unknown.
+    /// - [`QueueReleasePendingError::NotAssigned`] when the entry exists but
+    ///   is in a state other than Assigned. The error carries the entry's
+    ///   actual wire status so callers can surface it as the `-32208`
+    ///   `data.actual_state` payload.
+    pub fn release_pending(
+        &self,
+        entry_id: &str,
+        reason: &str,
+    ) -> std::result::Result<QueueReleasePendingResponse, QueueReleasePendingError> {
+        let _lock =
+            acquire_queue_lock(&self.project_root).map_err(QueueReleasePendingError::Backend)?;
+        let mut state = load_queue_state(&self.project_root)
+            .map_err(QueueReleasePendingError::Backend)?
+            .ok_or_else(|| QueueReleasePendingError::NotFound {
+                entry_id: entry_id.to_string(),
+            })?;
+
+        let entry = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.entry_id == entry_id)
+            .ok_or_else(|| QueueReleasePendingError::NotFound {
+                entry_id: entry_id.to_string(),
+            })?;
+
+        if entry.status != DispatchQueueEntryStatus::Assigned {
+            return Err(QueueReleasePendingError::NotAssigned {
+                entry_id: entry_id.to_string(),
+                actual_state: entry.status.as_wire().to_string(),
+            });
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let from_status = entry.status.as_wire().to_string();
+        entry.status = DispatchQueueEntryStatus::Pending;
+        entry.assigned_at = None;
+        entry.workflow_id = None;
+        // TODO(codex-p2): fence late completions from the released workflow so
+        // they cannot prune the replacement lease on entry id reuse. Requires
+        // touching the completion path (see queue_service.rs completion()).
+        entry.audit_log.push(DispatchQueueAuditEntry {
+            at: now,
+            method: "queue/release_pending".to_string(),
+            from_status,
+            to_status: status::PENDING.to_string(),
+            reason: reason.to_string(),
+        });
+
+        save_queue_state(&self.project_root, &state).map_err(QueueReleasePendingError::Backend)?;
+
+        Ok(QueueReleasePendingResponse {
+            entry_id: entry_id.to_string(),
+            status: status::PENDING.to_string(),
+        })
+    }
+
+    // ============================================================
     // Internal helpers
     // ============================================================
 
@@ -511,6 +576,31 @@ pub enum QueueLeaseError {
         expected: usize,
         /// `workflow_ids.len()` from the request.
         actual: usize,
+    },
+    /// Wrapped backend error (I/O, lock acquisition, persistence).
+    #[error(transparent)]
+    Backend(anyhow::Error),
+}
+
+/// Typed errors specific to `queue/release_pending`.
+#[derive(Debug, thiserror::Error)]
+pub enum QueueReleasePendingError {
+    /// Entry id was not found in the queue. Surfaced as JSON-RPC `-32602`
+    /// invalid_params per the v0.5.1 protocol contract.
+    #[error("entry_id not found: {entry_id}")]
+    NotFound {
+        /// Entry id from the request.
+        entry_id: String,
+    },
+    /// Entry exists but is not in the Assigned state. Surfaced as
+    /// [`animus_queue_protocol::error_codes::QUEUE_ENTRY_NOT_ASSIGNED`]
+    /// with `data.actual_state` populated.
+    #[error("entry {entry_id} is in state '{actual_state}', expected 'assigned'")]
+    NotAssigned {
+        /// Entry id from the request.
+        entry_id: String,
+        /// Actual wire status (`pending` / `held`).
+        actual_state: String,
     },
     /// Wrapped backend error (I/O, lock acquisition, persistence).
     #[error(transparent)]

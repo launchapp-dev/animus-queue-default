@@ -15,17 +15,18 @@ use animus_plugin_protocol::{
 use animus_queue_protocol::{
     error_codes as queue_error_codes, QueueCapabilities, QueueCompletionRequest, QueueDropRequest,
     QueueEnqueueRequest, QueueEnqueueResponse, QueueHoldRequest, QueueLeaseRequest,
-    QueueListRequest, QueueMarkAssignedRequest, QueueReleaseRequest, QueueReorderRequest, KIND,
-    METHOD_QUEUE_COMPLETION, METHOD_QUEUE_DROP, METHOD_QUEUE_ENQUEUE, METHOD_QUEUE_HOLD,
-    METHOD_QUEUE_LEASE, METHOD_QUEUE_LIST, METHOD_QUEUE_MARK_ASSIGNED, METHOD_QUEUE_RELEASE,
-    METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS, PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
+    QueueListRequest, QueueMarkAssignedRequest, QueueReleasePendingParams, QueueReleaseRequest,
+    QueueReorderRequest, KIND, METHOD_QUEUE_COMPLETION, METHOD_QUEUE_DROP, METHOD_QUEUE_ENQUEUE,
+    METHOD_QUEUE_HOLD, METHOD_QUEUE_LEASE, METHOD_QUEUE_LIST, METHOD_QUEUE_MARK_ASSIGNED,
+    METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING, METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS,
+    PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::queue_service::{QueueBackend, QueueLeaseError};
+use crate::queue_service::{QueueBackend, QueueLeaseError, QueueReleasePendingError};
 
 const PLUGIN_NAME: &str = "animus-queue-default";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -160,6 +161,7 @@ fn queue_methods() -> Vec<&'static str> {
         METHOD_QUEUE_STATS,
         METHOD_QUEUE_HOLD,
         METHOD_QUEUE_RELEASE,
+        METHOD_QUEUE_RELEASE_PENDING,
         METHOD_QUEUE_DROP,
         METHOD_QUEUE_REORDER,
         METHOD_QUEUE_MARK_ASSIGNED,
@@ -188,6 +190,9 @@ async fn handle_request(
         METHOD_QUEUE_STATS => Some(handle_stats(id, &backend).await),
         METHOD_QUEUE_HOLD => Some(handle_hold(id, request.params, &backend).await),
         METHOD_QUEUE_RELEASE => Some(handle_release(id, request.params, &backend).await),
+        METHOD_QUEUE_RELEASE_PENDING => {
+            Some(handle_release_pending(id, request.params, &backend).await)
+        }
         METHOD_QUEUE_DROP => Some(handle_drop(id, request.params, &backend).await),
         METHOD_QUEUE_REORDER => Some(handle_reorder(id, request.params, &backend).await),
         METHOD_QUEUE_MARK_ASSIGNED => {
@@ -488,6 +493,53 @@ async fn handle_release(
     match backend.release(&request.entry_id) {
         Ok(response) => to_value_response(id, &response),
         Err(error) => not_pending_or_internal(id, &error, "queue/release"),
+    }
+}
+
+async fn handle_release_pending(
+    id: Option<Value>,
+    params: Option<Value>,
+    backend: &Arc<RwLock<Option<QueueBackend>>>,
+) -> RpcResponse {
+    let backend = match require_backend(id.clone(), backend).await {
+        Ok(b) => b,
+        Err(response) => return response,
+    };
+    let request: QueueReleasePendingParams =
+        match parse_params(id.clone(), params, "queue/release_pending") {
+            Ok(req) => req,
+            Err(response) => return response,
+        };
+    match backend.release_pending(&request.entry_id, &request.reason) {
+        Ok(response) => to_value_response(id, &response),
+        // TODO(codex-p2): consider QUEUE_ENTRY_NOT_FOUND (-32201) here. The
+        // v0.5 fold-in brief specified -32602 invalid_params for the missing
+        // entry_id case so we honor that for now; revisit when queue clients
+        // need to distinguish a stale entry id from a malformed request.
+        Err(QueueReleasePendingError::NotFound { entry_id }) => RpcResponse::err(
+            id,
+            RpcError {
+                code: plugin_error_codes::INVALID_PARAMS,
+                message: format!("entry_id not found: {entry_id}"),
+                data: None,
+            },
+        ),
+        Err(QueueReleasePendingError::NotAssigned {
+            entry_id,
+            actual_state,
+        }) => RpcResponse::err(
+            id,
+            RpcError {
+                code: queue_error_codes::QUEUE_ENTRY_NOT_ASSIGNED,
+                message: format!(
+                    "entry {entry_id} is in state '{actual_state}', expected 'assigned'"
+                ),
+                data: Some(json!({ "actual_state": actual_state })),
+            },
+        ),
+        Err(QueueReleasePendingError::Backend(error)) => {
+            internal_error_response(id, format!("queue/release_pending failed: {error:#}"))
+        }
     }
 }
 

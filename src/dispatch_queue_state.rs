@@ -67,6 +67,27 @@ pub struct DispatchQueueEntry {
     /// RFC 3339 hold timestamp.
     #[serde(default)]
     pub held_at: Option<String>,
+    /// Audit log of state transitions recorded by reason-carrying mutations
+    /// (currently `queue/release_pending`). Older transitions remain absent
+    /// because legacy mutations did not record reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_log: Vec<DispatchQueueAuditEntry>,
+}
+
+/// One row in [`DispatchQueueEntry::audit_log`]. Captures who/why a
+/// reason-carrying state transition happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchQueueAuditEntry {
+    /// RFC 3339 timestamp of the transition.
+    pub at: String,
+    /// JSON-RPC method that caused the transition (e.g. `queue/release_pending`).
+    pub method: String,
+    /// Status the entry held before the transition (wire form).
+    pub from_status: String,
+    /// Status the entry holds after the transition (wire form).
+    pub to_status: String,
+    /// Caller-supplied audit reason.
+    pub reason: String,
 }
 
 /// On-disk top-level state shape.
@@ -91,6 +112,7 @@ impl DispatchQueueEntry {
             enqueued_at: Some(chrono::Utc::now().to_rfc3339()),
             assigned_at: None,
             held_at: None,
+            audit_log: Vec::new(),
         }
     }
 
