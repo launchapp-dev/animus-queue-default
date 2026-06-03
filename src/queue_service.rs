@@ -165,10 +165,19 @@ impl QueueBackend {
     /// If `workflow_ids` is `Some` its length MUST equal `max` (return
     /// [`QueueLeaseError::WorkflowIdCountMismatch`]). When `None`, synthetic
     /// UUIDs are generated.
+    ///
+    /// If `exclude_subjects` is `Some`, pending entries whose
+    /// `subject_dispatch.subject_key()` matches any id in the list are
+    /// skipped over without state transition. Daemons pass the set of
+    /// subjects that already have in-flight workflows so the queue can
+    /// advance past a head-of-line entry instead of returning it for
+    /// immediate `queue/release_pending` back to Pending. Backward-
+    /// compatible: `None` matches v0.2.0 behavior.
     pub fn lease(
         &self,
         max: usize,
         workflow_ids: Option<Vec<String>>,
+        exclude_subjects: Option<Vec<String>>,
     ) -> std::result::Result<QueueLeaseResponse, QueueLeaseError> {
         if let Some(ids) = workflow_ids.as_ref() {
             if ids.len() != max {
@@ -190,6 +199,8 @@ impl QueueBackend {
         let now_rfc3339 = Utc::now().to_rfc3339();
         let mut leased: Vec<QueueEntry> = Vec::new();
         let mut assigned_index = 0usize;
+        let exclude_set: Option<std::collections::HashSet<String>> =
+            exclude_subjects.map(|ids| ids.into_iter().collect());
 
         // FIFO within Pending — first-eligible-wins, in current order.
         for entry in state.entries.iter_mut() {
@@ -208,6 +219,19 @@ impl QueueBackend {
                     "queue/lease: skipping pending entry with no SubjectDispatch envelope"
                 );
                 continue;
+            }
+            if let Some(set) = exclude_set.as_ref() {
+                // Prefer the dispatch's canonical subject_key (matches the
+                // host's active-subject tracking); fall back to the stored
+                // subject_id for entries that migrated without a dispatch.
+                let key_owned = entry
+                    .dispatch
+                    .as_ref()
+                    .map(|d| d.subject_key())
+                    .unwrap_or_else(|| entry.subject_id_ref().to_string());
+                if set.contains(&key_owned) {
+                    continue;
+                }
             }
             let workflow_id = match workflow_ids.as_ref() {
                 Some(ids) => ids[assigned_index].clone(),

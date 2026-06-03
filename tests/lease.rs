@@ -31,7 +31,7 @@ fn lease_returns_multiple_entries_atomically() {
 
     let workflow_ids = vec!["wf-aaa".to_string(), "wf-bbb".to_string()];
     let leased = backend
-        .lease(2, Some(workflow_ids.clone()))
+        .lease(2, Some(workflow_ids.clone()), None)
         .expect("lease 2");
 
     assert_eq!(leased.leased.len(), 2, "should lease exactly 2 entries");
@@ -51,7 +51,7 @@ fn lease_returns_multiple_entries_atomically() {
     assert_eq!(listing.stats.pending, 1);
 
     // Second lease pulls TASK-3 only — earlier entries are now Assigned.
-    let next = backend.lease(2, None).expect("lease 2 again");
+    let next = backend.lease(2, None, None).expect("lease 2 again");
     assert_eq!(next.leased.len(), 1);
     assert_eq!(next.leased[0].subject_id, "TASK-3");
 }
@@ -64,7 +64,7 @@ fn lease_workflow_id_count_mismatch_returns_typed_error() {
         .enqueue(task_dispatch("TASK-1", "standard"))
         .expect("enqueue");
 
-    let result = backend.lease(2, Some(vec!["wf-only-one".to_string()]));
+    let result = backend.lease(2, Some(vec!["wf-only-one".to_string()]), None);
     match result {
         Err(QueueLeaseError::WorkflowIdCountMismatch { expected, actual }) => {
             assert_eq!(expected, 2);
@@ -88,7 +88,7 @@ fn lease_synthesizes_workflow_ids_when_omitted() {
         .enqueue(task_dispatch("TASK-1", "standard"))
         .expect("enqueue");
 
-    let leased = backend.lease(1, None).expect("lease");
+    let leased = backend.lease(1, None, None).expect("lease");
     assert_eq!(leased.leased.len(), 1);
     let workflow_id = leased.leased[0]
         .workflow_id
@@ -142,7 +142,7 @@ fn completion_prunes_assigned_entries() {
         .enqueue(task_dispatch("TASK-1", "standard"))
         .expect("enqueue");
     let leased = backend
-        .lease(1, Some(vec!["wf-1".to_string()]))
+        .lease(1, Some(vec!["wf-1".to_string()]), None)
         .expect("lease");
     let entry_id = leased.leased[0].entry_id.clone();
 
@@ -212,7 +212,7 @@ fn lease_skips_held_entries() {
 
     backend.hold(&one.entry_id).expect("hold first");
 
-    let leased = backend.lease(5, None).expect("lease 5");
+    let leased = backend.lease(5, None, None).expect("lease 5");
     assert_eq!(leased.leased.len(), 1);
     assert_eq!(leased.leased[0].entry_id, two.entry_id);
 }
@@ -225,7 +225,7 @@ fn release_pending_returns_assigned_entry_to_pending() {
         .enqueue(task_dispatch("TASK-1", "standard"))
         .expect("enqueue");
     let leased = backend
-        .lease(1, Some(vec!["wf-1".to_string()]))
+        .lease(1, Some(vec!["wf-1".to_string()]), None)
         .expect("lease");
     assert_eq!(leased.leased.len(), 1);
     assert_eq!(leased.leased[0].entry_id, enqueued.entry_id);
@@ -332,7 +332,7 @@ fn release_pending_then_release_to_new_holder_succeeds() {
 
     // First holder leases.
     let first_lease = backend
-        .lease(1, Some(vec!["wf-original".to_string()]))
+        .lease(1, Some(vec!["wf-original".to_string()]), None)
         .expect("first lease");
     assert_eq!(first_lease.leased.len(), 1);
     assert_eq!(
@@ -347,7 +347,7 @@ fn release_pending_then_release_to_new_holder_succeeds() {
 
     // A second lease attempt picks the same entry up for a new holder.
     let second_lease = backend
-        .lease(1, Some(vec!["wf-replacement".to_string()]))
+        .lease(1, Some(vec!["wf-replacement".to_string()]), None)
         .expect("second lease");
     assert_eq!(second_lease.leased.len(), 1);
     assert_eq!(second_lease.leased[0].entry_id, enqueued.entry_id);
@@ -363,4 +363,118 @@ fn release_pending_then_release_to_new_holder_succeeds() {
     assert_eq!(listing.stats.total, 1);
     assert_eq!(listing.stats.assigned, 1);
     assert_eq!(listing.stats.pending, 0);
+}
+
+#[test]
+fn lease_with_exclude_subjects_skips_matching_subjects() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let _t1 = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue 1");
+    let t2 = backend
+        .enqueue(task_dispatch("TASK-2", "standard"))
+        .expect("enqueue 2");
+    let _t3 = backend
+        .enqueue(task_dispatch("TASK-3", "standard"))
+        .expect("enqueue 3");
+
+    // Exclude TASK-1 and TASK-3 — only TASK-2 should be leased even though
+    // TASK-1 is at the head of the queue.
+    let leased = backend
+        .lease(
+            5,
+            None,
+            Some(vec!["TASK-1".to_string(), "TASK-3".to_string()]),
+        )
+        .expect("lease with excludes");
+    assert_eq!(
+        leased.leased.len(),
+        1,
+        "only TASK-2 should be leased; got {:?}",
+        leased
+            .leased
+            .iter()
+            .map(|e| e.subject_id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(leased.leased[0].subject_id, "TASK-2");
+    assert_eq!(leased.leased[0].entry_id, t2.entry_id);
+
+    // Excluded entries stay Pending (no state transition).
+    let listing = backend.list(&[], None, None).expect("list");
+    assert_eq!(listing.stats.total, 3);
+    assert_eq!(listing.stats.assigned, 1);
+    assert_eq!(listing.stats.pending, 2);
+}
+
+#[test]
+fn lease_with_empty_exclude_acts_as_no_exclude() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let t1 = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue 1");
+    let t2 = backend
+        .enqueue(task_dispatch("TASK-2", "standard"))
+        .expect("enqueue 2");
+
+    // Empty Vec — semantically "exclude nothing", same behavior as None.
+    let leased = backend
+        .lease(5, None, Some(Vec::new()))
+        .expect("lease with empty exclude");
+    assert_eq!(leased.leased.len(), 2);
+    assert_eq!(leased.leased[0].entry_id, t1.entry_id);
+    assert_eq!(leased.leased[1].entry_id, t2.entry_id);
+}
+
+#[test]
+fn lease_with_no_matching_exclude_still_returns_non_excluded() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let t1 = backend
+        .enqueue(task_dispatch("TASK-1", "standard"))
+        .expect("enqueue 1");
+    let t2 = backend
+        .enqueue(task_dispatch("TASK-2", "standard"))
+        .expect("enqueue 2");
+
+    // Exclude an id that isn't in the queue — both entries still lease.
+    let leased = backend
+        .lease(
+            5,
+            None,
+            Some(vec!["TASK-DOES-NOT-EXIST".to_string()]),
+        )
+        .expect("lease with non-matching exclude");
+    assert_eq!(leased.leased.len(), 2);
+    assert_eq!(leased.leased[0].entry_id, t1.entry_id);
+    assert_eq!(leased.leased[1].entry_id, t2.entry_id);
+}
+
+#[test]
+fn lease_excludes_subject_at_head_of_queue() {
+    // HoL regression guard: TASK-HOL is at the front of the queue but
+    // is excluded; lease must advance and return TASK-2 instead of
+    // returning empty.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    let hol = backend
+        .enqueue(task_dispatch("TASK-HOL", "standard"))
+        .expect("enqueue head");
+    let t2 = backend
+        .enqueue(task_dispatch("TASK-2", "standard"))
+        .expect("enqueue second");
+
+    let leased = backend
+        .lease(1, None, Some(vec!["TASK-HOL".to_string()]))
+        .expect("lease with head excluded");
+    assert_eq!(leased.leased.len(), 1);
+    assert_eq!(leased.leased[0].entry_id, t2.entry_id);
+    assert_ne!(leased.leased[0].entry_id, hol.entry_id);
+
+    // HoL entry stays Pending.
+    let listing = backend.list(&[], None, None).expect("list");
+    assert_eq!(listing.stats.pending, 1);
+    assert_eq!(listing.stats.assigned, 1);
 }

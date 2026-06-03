@@ -419,7 +419,10 @@ async fn handle_lease(
         Err(response) => return response,
     };
 
-    match backend.lease(request.max, request.workflow_ids) {
+    let exclude_subjects = request
+        .exclude_subjects
+        .map(|ids| ids.into_iter().map(|id| id.0).collect::<Vec<String>>());
+    match backend.lease(request.max, request.workflow_ids, exclude_subjects) {
         Ok(response) => to_value_response(id, &response),
         Err(QueueLeaseError::WorkflowIdCountMismatch { expected, actual }) => RpcResponse::err(
             id,
