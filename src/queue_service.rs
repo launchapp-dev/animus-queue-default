@@ -199,7 +199,7 @@ impl QueueBackend {
         let now_rfc3339 = Utc::now().to_rfc3339();
         let mut leased: Vec<QueueEntry> = Vec::new();
         let mut assigned_index = 0usize;
-        let exclude_set: Option<std::collections::HashSet<String>> =
+        let mut exclude_set: Option<std::collections::HashSet<String>> =
             exclude_subjects.map(|ids| ids.into_iter().collect());
 
         // FIFO within Pending — first-eligible-wins, in current order.
@@ -220,7 +220,7 @@ impl QueueBackend {
                 );
                 continue;
             }
-            if let Some(set) = exclude_set.as_ref() {
+            if let Some(set) = exclude_set.as_mut() {
                 // Prefer the dispatch's canonical subject_key (matches the
                 // host's active-subject tracking); fall back to the stored
                 // subject_id for entries that migrated without a dispatch.
@@ -232,6 +232,11 @@ impl QueueBackend {
                 if set.contains(&key_owned) {
                     continue;
                 }
+                // Leasing this entry makes its subject in-flight for the rest
+                // of the batch — otherwise two pending entries for the same
+                // subject can be leased together, defeating the exclusivity
+                // the caller asked for via `exclude_subjects`.
+                set.insert(key_owned);
             }
             let workflow_id = match workflow_ids.as_ref() {
                 Some(ids) => ids[assigned_index].clone(),
