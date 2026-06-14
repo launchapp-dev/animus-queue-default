@@ -32,11 +32,16 @@ on the next lease/enqueue sweep instead of dispatched late (`None` = always
 fire late). `QueueStats::deferred` counts the not-yet-leasable subset of
 `pending`.
 
-Deferred enqueues are **never deduped** (scheduling the same subject for
-distinct times is legitimate); a collision with an existing entry is
-surfaced via `QueueEnqueueResponse::warning` and the caller decides. The
-immediate (no `run_at`) path keeps its `(subject, workflow_ref)`
-idempotency and now reports the no-op via `warning`.
+Enqueue is **never deduped** (queue-protocol 0.3.2+): both immediate and
+deferred enqueues always create a new entry, and a collision with an
+existing entry for the same subject is surfaced via
+`QueueEnqueueResponse::warning` for the caller to act on. Lease-side
+`exclude_subjects` still prevents two entries for the same subject from
+running concurrently.
+
+`queue/next_deadline` returns the earliest future `run_at` across pending
+deferred entries (or `None`), so the daemon can sleep until exactly that
+instant instead of waiting for its heartbeat.
 
 ## State / lock layout
 

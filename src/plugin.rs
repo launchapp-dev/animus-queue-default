@@ -18,8 +18,8 @@ use animus_queue_protocol::{
     QueueListRequest, QueueMarkAssignedRequest, QueueReleasePendingParams, QueueReleaseRequest,
     QueueReorderRequest, KIND, METHOD_QUEUE_COMPLETION, METHOD_QUEUE_DROP, METHOD_QUEUE_ENQUEUE,
     METHOD_QUEUE_HOLD, METHOD_QUEUE_LEASE, METHOD_QUEUE_LIST, METHOD_QUEUE_MARK_ASSIGNED,
-    METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING, METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS,
-    PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
+    METHOD_QUEUE_NEXT_DEADLINE, METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING,
+    METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS, PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -159,6 +159,7 @@ fn queue_methods() -> Vec<&'static str> {
         METHOD_QUEUE_LIST,
         METHOD_QUEUE_LEASE,
         METHOD_QUEUE_STATS,
+        METHOD_QUEUE_NEXT_DEADLINE,
         METHOD_QUEUE_HOLD,
         METHOD_QUEUE_RELEASE,
         METHOD_QUEUE_RELEASE_PENDING,
@@ -188,6 +189,7 @@ async fn handle_request(
         METHOD_QUEUE_LIST => Some(handle_list(id, request.params, &backend).await),
         METHOD_QUEUE_LEASE => Some(handle_lease(id, request.params, &backend).await),
         METHOD_QUEUE_STATS => Some(handle_stats(id, &backend).await),
+        METHOD_QUEUE_NEXT_DEADLINE => Some(handle_next_deadline(id, &backend).await),
         METHOD_QUEUE_HOLD => Some(handle_hold(id, request.params, &backend).await),
         METHOD_QUEUE_RELEASE => Some(handle_release(id, request.params, &backend).await),
         METHOD_QUEUE_RELEASE_PENDING => {
@@ -458,6 +460,24 @@ async fn handle_stats(
     match backend.stats() {
         Ok(stats) => to_value_response(id, &stats),
         Err(error) => internal_error_response(id, format!("queue/stats failed: {error:#}")),
+    }
+}
+
+// ============================================================
+// queue/next_deadline
+// ============================================================
+
+async fn handle_next_deadline(
+    id: Option<Value>,
+    backend: &Arc<RwLock<Option<QueueBackend>>>,
+) -> RpcResponse {
+    let backend = match require_backend(id.clone(), backend).await {
+        Ok(b) => b,
+        Err(response) => return response,
+    };
+    match backend.next_deadline() {
+        Ok(resp) => to_value_response(id, &resp),
+        Err(error) => internal_error_response(id, format!("queue/next_deadline failed: {error:#}")),
     }
 }
 

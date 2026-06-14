@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use animus_queue_protocol::{
     completion_status, status, QueueEntry, QueueLeaseResponse, QueueListResponse,
-    QueueMutationResponse, QueueReleasePendingResponse, QueueReorderResponse, QueueStats,
+    QueueMutationResponse, QueueNextDeadlineResponse, QueueReleasePendingResponse,
+    QueueReorderResponse, QueueStats,
 };
 use animus_subject_protocol::SubjectDispatch;
 use anyhow::Result;
@@ -77,10 +78,14 @@ impl QueueBackend {
         sweep_expired_entries(&mut state, Utc::now());
 
         let subject_id = dispatch.subject_key();
-        let is_deferred = run_at.is_some();
 
         // Count live (non-Unknown) entries already targeting this subject —
-        // used for the advisory warning regardless of workflow_ref.
+        // used for the advisory warning. Enqueue is NOT idempotent in either
+        // direction: immediate and deferred enqueues both always create a new
+        // entry, and a subject collision is surfaced as a warning for the
+        // caller (agent/operator) to act on rather than silently dropped.
+        // Lease-side `exclude_subjects` still prevents two entries for the
+        // same subject from running concurrently.
         let dup_count = state
             .entries
             .iter()
@@ -89,40 +94,6 @@ impl QueueBackend {
                     && entry.subject_id_ref() == subject_id
             })
             .count();
-
-        // Idempotency (immediate path only): an existing live entry for the
-        // same (subject_key, workflow_ref) is a no-op. (Mirrors the in-tree
-        // semantics; see `enqueue_subject_dispatch_is_idempotent_for_same_task_pipeline`.)
-        if !is_deferred {
-            if let Some(existing) = state.entries.iter().find(|entry| {
-                if entry.subject_id_ref() != subject_id {
-                    return false;
-                }
-                if entry.status == DispatchQueueEntryStatus::Unknown {
-                    return false;
-                }
-                if let Some(existing_dispatch) = entry.dispatch.as_ref() {
-                    existing_dispatch.workflow_ref == dispatch.workflow_ref
-                } else {
-                    match (entry.task_id_ref(), dispatch.task_id()) {
-                        (Some(existing_task), Some(incoming_task)) => {
-                            existing_task == incoming_task
-                        }
-                        _ => false,
-                    }
-                }
-            }) {
-                let entry_id = existing.entry_id.clone();
-                return Ok(EnqueueOutcome {
-                    enqueued: false,
-                    warning: Some(format!(
-                        "idempotent no-op: subject {subject_id} is already queued as entry {entry_id}"
-                    )),
-                    entry_id,
-                    subject_id,
-                });
-            }
-        }
 
         let warning = (dup_count > 0).then(|| {
             format!(
@@ -199,6 +170,33 @@ impl QueueBackend {
         let _lock = acquire_queue_lock(&self.project_root)?;
         let state = load_queue_state(&self.project_root)?.unwrap_or_default();
         Ok(stats_from_state(&state))
+    }
+
+    // ============================================================
+    // queue/next_deadline
+    // ============================================================
+
+    /// Earliest future `run_at` across pending deferred entries, for the
+    /// daemon's precise-wake loop. Expired entries are swept first, so any
+    /// returned instant is strictly in the future. `None` when no
+    /// future-dated pending entry remains.
+    pub fn next_deadline(&self) -> Result<QueueNextDeadlineResponse> {
+        let _lock = acquire_queue_lock(&self.project_root)?;
+        let mut state = load_queue_state(&self.project_root)?.unwrap_or_default();
+        let now = Utc::now();
+        let swept = sweep_expired_entries(&mut state, now);
+        let next_run_at = state
+            .entries
+            .iter()
+            .filter(|entry| entry.status == DispatchQueueEntryStatus::Pending)
+            .filter_map(|entry| entry.parsed_run_at())
+            .filter(|run_at| *run_at > now)
+            .min()
+            .map(|run_at| run_at.to_rfc3339());
+        if swept > 0 {
+            save_queue_state(&self.project_root, &state)?;
+        }
+        Ok(QueueNextDeadlineResponse { next_run_at })
     }
 
     // ============================================================
@@ -809,7 +807,11 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_subject_dispatch_is_idempotent_for_same_task_pipeline() {
+    fn enqueue_same_subject_pipeline_creates_distinct_entries_with_warning() {
+        // Enqueue is no longer idempotent: re-enqueuing the same subject
+        // creates a second entry and surfaces a warning. Lease-side
+        // exclusivity (not enqueue dedup) keeps the subject from running twice
+        // concurrently.
         let temp = tempfile::tempdir().expect("tempdir");
         let backend = QueueBackend::new(temp.path().to_path_buf());
         let dispatch = SubjectDispatch::for_subject_with_metadata(
@@ -825,11 +827,12 @@ mod tests {
         let second = backend.enqueue(dispatch, None, None).expect("enqueue");
 
         assert!(first.enqueued);
-        assert!(!second.enqueued);
-        // Idempotent — second enqueue returns the same entry id.
-        assert_eq!(first.entry_id, second.entry_id);
+        assert!(second.enqueued, "re-enqueue creates a new entry");
+        assert!(first.warning.is_none());
+        assert!(second.warning.is_some(), "collision surfaces a warning");
+        assert_ne!(first.entry_id, second.entry_id);
         let listed = backend.list(&[], None, None).expect("list");
-        assert_eq!(listed.stats.total, 1);
+        assert_eq!(listed.stats.total, 2);
         assert_eq!(listed.entries[0].subject_id, "TASK-1");
     }
 
@@ -1007,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_duplicate_is_idempotent_with_warning() {
+    fn immediate_duplicate_is_enqueued_with_warning() {
         let temp = tempfile::tempdir().expect("tempdir");
         let backend = QueueBackend::new(temp.path().to_path_buf());
         let first = backend
@@ -1018,14 +1021,38 @@ mod tests {
             .expect("enqueue second");
 
         assert!(first.enqueued);
-        assert!(!second.enqueued, "immediate duplicate stays idempotent");
-        assert_eq!(first.entry_id, second.entry_id);
-        assert!(
-            second.warning.is_some(),
-            "idempotent no-op carries a warning"
-        );
+        assert!(second.enqueued, "immediate duplicate is now enqueued, not deduped");
+        assert_ne!(first.entry_id, second.entry_id);
+        assert!(second.warning.is_some(), "collision surfaces a warning");
 
         let listed = backend.list(&[], None, None).expect("list");
-        assert_eq!(listed.stats.total, 1);
+        assert_eq!(listed.stats.total, 2);
+    }
+
+    #[test]
+    fn next_deadline_reports_earliest_future_run_at() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+
+        // Empty queue → no deadline.
+        assert_eq!(backend.next_deadline().expect("nd").next_run_at, None);
+
+        // Immediate entry contributes no deadline.
+        backend
+            .enqueue(task_dispatch("NOW", "standard"), None, None)
+            .expect("immediate");
+        assert_eq!(backend.next_deadline().expect("nd").next_run_at, None);
+
+        // Two deferred entries → earliest wins.
+        let later = (Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+        let sooner = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        backend
+            .enqueue(task_dispatch("LATER", "standard"), Some(later), None)
+            .expect("later");
+        backend
+            .enqueue(task_dispatch("SOONER", "standard"), Some(sooner.clone()), None)
+            .expect("sooner");
+
+        assert_eq!(backend.next_deadline().expect("nd").next_run_at, Some(sooner));
     }
 }
