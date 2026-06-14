@@ -67,6 +67,16 @@ pub struct DispatchQueueEntry {
     /// RFC 3339 hold timestamp.
     #[serde(default)]
     pub held_at: Option<String>,
+    /// RFC 3339 earliest-dispatch time for a deferred entry. While `now` is
+    /// before this instant the entry stays Pending but is excluded from
+    /// `queue/lease`. `None` for ordinary (dispatch-ASAP) entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
+    /// Grace window in seconds after `run_at` before a still-pending deferred
+    /// entry is expired and dropped on sweep. `None` = never expire. Ignored
+    /// when `run_at` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_after_secs: Option<u64>,
     /// Audit log of state transitions recorded by reason-carrying mutations
     /// (currently `queue/release_pending`). Older transitions remain absent
     /// because legacy mutations did not record reasons.
@@ -100,8 +110,14 @@ pub struct DispatchQueueState {
 
 impl DispatchQueueEntry {
     /// Build a fresh Pending entry from a `SubjectDispatch`, assigning a
-    /// stable `entry_id` and capturing `enqueued_at`.
-    pub fn from_dispatch(dispatch: SubjectDispatch) -> Self {
+    /// stable `entry_id` and capturing `enqueued_at`. `run_at` /
+    /// `expire_after_secs` carry deferred-dispatch metadata (both `None`
+    /// for an ordinary dispatch-ASAP entry).
+    pub fn from_dispatch(
+        dispatch: SubjectDispatch,
+        run_at: Option<String>,
+        expire_after_secs: Option<u64>,
+    ) -> Self {
         Self {
             entry_id: uuid::Uuid::new_v4().to_string(),
             subject_id: Some(dispatch.subject_key()),
@@ -112,8 +128,47 @@ impl DispatchQueueEntry {
             enqueued_at: Some(chrono::Utc::now().to_rfc3339()),
             assigned_at: None,
             held_at: None,
+            run_at,
+            expire_after_secs,
             audit_log: Vec::new(),
         }
+    }
+
+    /// `true` when this entry is deferred and its `run_at` instant has not
+    /// yet been reached as of `now`. Unparseable `run_at` values are treated
+    /// as eligible (dispatch now) so a malformed timestamp never wedges an
+    /// entry permanently.
+    pub fn is_deferred_until_future(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match self.parsed_run_at() {
+            Some(run_at) => now < run_at,
+            None => false,
+        }
+    }
+
+    /// Parse `run_at` into a UTC instant, if present and well-formed.
+    pub fn parsed_run_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let raw = self.run_at.as_deref()?;
+        match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(err) => {
+                tracing::warn!(
+                    entry_id = %self.entry_id,
+                    run_at = raw,
+                    error = %err,
+                    "queue entry has unparseable run_at; treating as immediately eligible"
+                );
+                None
+            }
+        }
+    }
+
+    /// The instant at which a deferred entry should be expired (dropped
+    /// instead of dispatched late): `run_at + expire_after_secs`. `None`
+    /// when the entry is not deferred or has no expiry window.
+    pub fn expiry_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let run_at = self.parsed_run_at()?;
+        let secs = self.expire_after_secs?;
+        Some(run_at + chrono::Duration::seconds(secs as i64))
     }
 
     /// Effective subject id (falls back to `dispatch.subject_id` then to

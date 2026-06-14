@@ -14,7 +14,6 @@ dependencies = [
 [[package]]
 name = "animus-plugin-protocol"
 version = "0.1.14"
-source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.3#6b114186adc16a2b59a47702b578c0138a33241c"
 dependencies = [
  "schemars",
  "serde",
@@ -23,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "animus-queue-default"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "animus-plugin-protocol",
  "animus-queue-protocol",
@@ -43,8 +42,7 @@ dependencies = [
 
 [[package]]
 name = "animus-queue-protocol"
-version = "0.3.0"
-source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.3#6b114186adc16a2b59a47702b578c0138a33241c"
+version = "0.3.1"
 dependencies = [
  "animus-plugin-protocol",
  "animus-subject-protocol",
@@ -55,8 +53,7 @@ dependencies = [
 
 [[package]]
 name = "animus-subject-protocol"
-version = "0.1.14"
-source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.3#6b114186adc16a2b59a47702b578c0138a33241c"
+version = "0.1.15"
 dependencies = [
  "animus-plugin-protocol",
  "anyhow",

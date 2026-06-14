@@ -354,13 +354,18 @@ async fn handle_enqueue(
         Err(response) => return response,
     };
 
-    match backend.enqueue(request.subject_dispatch) {
+    match backend.enqueue(
+        request.subject_dispatch,
+        request.run_at,
+        request.expire_after_secs,
+    ) {
         Ok(outcome) => to_value_response(
             id,
             &QueueEnqueueResponse {
                 enqueued: outcome.enqueued,
                 entry_id: outcome.entry_id,
                 subject_id: outcome.subject_id,
+                warning: outcome.warning,
             },
         ),
         Err(error) => internal_error_response(id, format!("queue/enqueue failed: {error:#}")),

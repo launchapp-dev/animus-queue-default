@@ -20,6 +20,24 @@ The queue plugin owns:
 Capacity / dispatch headroom / active-workflow filtering stays in the
 daemon (kernel concern). The plugin just provides ordered access.
 
+## Deferred dispatch (`run_at`)
+
+`queue/enqueue` accepts optional `run_at` (RFC 3339) and
+`expire_after_secs` (`animus-queue-protocol` 0.3.1+). When `run_at` is set
+and in the future the entry is enqueued as **deferred**: it stays
+`pending` but is excluded from `queue/lease` until the instant passes, then
+dispatches on the next lease. `expire_after_secs` is a grace window — a
+still-pending deferred entry past `run_at + expire_after_secs` is dropped
+on the next lease/enqueue sweep instead of dispatched late (`None` = always
+fire late). `QueueStats::deferred` counts the not-yet-leasable subset of
+`pending`.
+
+Deferred enqueues are **never deduped** (scheduling the same subject for
+distinct times is legitimate); a collision with an existing entry is
+surfaced via `QueueEnqueueResponse::warning` and the caller decides. The
+immediate (no `run_at`) path keeps its `(subject, workflow_ref)`
+idempotency and now reports the no-op via `warning`.
+
 ## State / lock layout
 
 The plugin binds a project root at `initialize` time via

@@ -20,13 +20,13 @@ fn lease_returns_multiple_entries_atomically() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let first = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue 1");
     let second = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue 2");
     let _third = backend
-        .enqueue(task_dispatch("TASK-3", "standard"))
+        .enqueue(task_dispatch("TASK-3", "standard"), None, None)
         .expect("enqueue 3");
 
     let workflow_ids = vec!["wf-aaa".to_string(), "wf-bbb".to_string()];
@@ -61,7 +61,7 @@ fn lease_workflow_id_count_mismatch_returns_typed_error() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
 
     let result = backend.lease(2, Some(vec!["wf-only-one".to_string()]), None);
@@ -85,7 +85,7 @@ fn lease_synthesizes_workflow_ids_when_omitted() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
 
     let leased = backend.lease(1, None, None).expect("lease");
@@ -107,10 +107,10 @@ fn completion_does_not_drop_pending_or_held_entries() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let pending = backend
-        .enqueue(task_dispatch("TASK-PENDING", "standard"))
+        .enqueue(task_dispatch("TASK-PENDING", "standard"), None, None)
         .expect("enqueue pending");
     let to_hold = backend
-        .enqueue(task_dispatch("TASK-HELD", "standard"))
+        .enqueue(task_dispatch("TASK-HELD", "standard"), None, None)
         .expect("enqueue held");
     backend.hold(&to_hold.entry_id).expect("hold");
 
@@ -139,7 +139,7 @@ fn completion_prunes_assigned_entries() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
     let leased = backend
         .lease(1, Some(vec!["wf-1".to_string()]), None)
@@ -204,10 +204,10 @@ fn lease_skips_held_entries() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let one = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue 1");
     let two = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue 2");
 
     backend.hold(&one.entry_id).expect("hold first");
@@ -222,7 +222,7 @@ fn release_pending_returns_assigned_entry_to_pending() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let enqueued = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
     let leased = backend
         .lease(1, Some(vec!["wf-1".to_string()]), None)
@@ -261,7 +261,7 @@ fn release_pending_on_pending_entry_returns_not_assigned() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let enqueued = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
 
     let result = backend.release_pending(&enqueued.entry_id, "no-op");
@@ -288,7 +288,7 @@ fn release_pending_on_held_entry_returns_not_assigned_with_actual_state() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let enqueued = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
     backend.hold(&enqueued.entry_id).expect("hold");
 
@@ -310,7 +310,7 @@ fn release_pending_on_unknown_entry_returns_not_found() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
 
     let result = backend.release_pending("does-not-exist", "operator-cancel");
@@ -327,7 +327,7 @@ fn release_pending_then_release_to_new_holder_succeeds() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let enqueued = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue");
 
     // First holder leases.
@@ -370,13 +370,13 @@ fn lease_with_exclude_subjects_skips_matching_subjects() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let _t1 = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue 1");
     let t2 = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue 2");
     let _t3 = backend
-        .enqueue(task_dispatch("TASK-3", "standard"))
+        .enqueue(task_dispatch("TASK-3", "standard"), None, None)
         .expect("enqueue 3");
 
     // Exclude TASK-1 and TASK-3 — only TASK-2 should be leased even though
@@ -413,10 +413,10 @@ fn lease_with_empty_exclude_acts_as_no_exclude() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let t1 = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue 1");
     let t2 = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue 2");
 
     // Empty Vec — semantically "exclude nothing", same behavior as None.
@@ -433,19 +433,15 @@ fn lease_with_no_matching_exclude_still_returns_non_excluded() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let t1 = backend
-        .enqueue(task_dispatch("TASK-1", "standard"))
+        .enqueue(task_dispatch("TASK-1", "standard"), None, None)
         .expect("enqueue 1");
     let t2 = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue 2");
 
     // Exclude an id that isn't in the queue — both entries still lease.
     let leased = backend
-        .lease(
-            5,
-            None,
-            Some(vec!["TASK-DOES-NOT-EXIST".to_string()]),
-        )
+        .lease(5, None, Some(vec!["TASK-DOES-NOT-EXIST".to_string()]))
         .expect("lease with non-matching exclude");
     assert_eq!(leased.leased.len(), 2);
     assert_eq!(leased.leased[0].entry_id, t1.entry_id);
@@ -460,10 +456,10 @@ fn lease_excludes_subject_at_head_of_queue() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = QueueBackend::new(temp.path().to_path_buf());
     let hol = backend
-        .enqueue(task_dispatch("TASK-HOL", "standard"))
+        .enqueue(task_dispatch("TASK-HOL", "standard"), None, None)
         .expect("enqueue head");
     let t2 = backend
-        .enqueue(task_dispatch("TASK-2", "standard"))
+        .enqueue(task_dispatch("TASK-2", "standard"), None, None)
         .expect("enqueue second");
 
     let leased = backend

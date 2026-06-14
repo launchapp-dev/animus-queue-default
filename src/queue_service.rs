@@ -34,6 +34,9 @@ pub struct EnqueueOutcome {
     pub entry_id: String,
     /// Subject id from the dispatch envelope.
     pub subject_id: String,
+    /// Non-fatal advisory surfaced to the caller (e.g. another entry already
+    /// exists for this subject). `None` when there is nothing to flag.
+    pub warning: Option<String>,
 }
 
 impl QueueBackend {
@@ -52,40 +55,83 @@ impl QueueBackend {
     // queue/enqueue
     // ============================================================
 
-    /// Append a dispatch to the queue. Idempotent on duplicate (same
-    /// subject key + same `workflow_ref`).
-    pub fn enqueue(&self, dispatch: SubjectDispatch) -> Result<EnqueueOutcome> {
+    /// Append a dispatch to the queue.
+    ///
+    /// Immediate enqueues (`run_at` is `None`) stay idempotent: an existing
+    /// live entry for the same `(subject_key, workflow_ref)` is a no-op.
+    /// Deferred enqueues (`run_at` set) are always created — scheduling the
+    /// same subject for distinct times is legitimate — and any collision
+    /// with an existing entry is surfaced via [`EnqueueOutcome::warning`]
+    /// rather than rejected. The caller decides what to do with the warning.
+    pub fn enqueue(
+        &self,
+        dispatch: SubjectDispatch,
+        run_at: Option<String>,
+        expire_after_secs: Option<u64>,
+    ) -> Result<EnqueueOutcome> {
         let _lock = acquire_queue_lock(&self.project_root)?;
         let mut state = load_queue_state(&self.project_root)?.unwrap_or_default();
-        let subject_id = dispatch.subject_key();
 
-        // Idempotency: an existing pending/assigned/held entry for the same
-        // (subject_key, workflow_ref) is a no-op. (Mirrors the in-tree
-        // semantics; see queue_service.rs `enqueue_subject_dispatch_is_idempotent_for_same_task_pipeline`.)
-        if let Some(existing) = state.entries.iter().find(|entry| {
-            if entry.subject_id_ref() != subject_id {
-                return false;
-            }
-            if entry.status == DispatchQueueEntryStatus::Unknown {
-                return false;
-            }
-            if let Some(existing_dispatch) = entry.dispatch.as_ref() {
-                existing_dispatch.workflow_ref == dispatch.workflow_ref
-            } else {
-                match (entry.task_id_ref(), dispatch.task_id()) {
-                    (Some(existing_task), Some(incoming_task)) => existing_task == incoming_task,
-                    _ => false,
+        // Drop any expired deferred entries before evaluating this enqueue so
+        // duplicate counts reflect the live queue.
+        sweep_expired_entries(&mut state, Utc::now());
+
+        let subject_id = dispatch.subject_key();
+        let is_deferred = run_at.is_some();
+
+        // Count live (non-Unknown) entries already targeting this subject —
+        // used for the advisory warning regardless of workflow_ref.
+        let dup_count = state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.status != DispatchQueueEntryStatus::Unknown
+                    && entry.subject_id_ref() == subject_id
+            })
+            .count();
+
+        // Idempotency (immediate path only): an existing live entry for the
+        // same (subject_key, workflow_ref) is a no-op. (Mirrors the in-tree
+        // semantics; see `enqueue_subject_dispatch_is_idempotent_for_same_task_pipeline`.)
+        if !is_deferred {
+            if let Some(existing) = state.entries.iter().find(|entry| {
+                if entry.subject_id_ref() != subject_id {
+                    return false;
                 }
+                if entry.status == DispatchQueueEntryStatus::Unknown {
+                    return false;
+                }
+                if let Some(existing_dispatch) = entry.dispatch.as_ref() {
+                    existing_dispatch.workflow_ref == dispatch.workflow_ref
+                } else {
+                    match (entry.task_id_ref(), dispatch.task_id()) {
+                        (Some(existing_task), Some(incoming_task)) => {
+                            existing_task == incoming_task
+                        }
+                        _ => false,
+                    }
+                }
+            }) {
+                let entry_id = existing.entry_id.clone();
+                return Ok(EnqueueOutcome {
+                    enqueued: false,
+                    warning: Some(format!(
+                        "idempotent no-op: subject {subject_id} is already queued as entry {entry_id}"
+                    )),
+                    entry_id,
+                    subject_id,
+                });
             }
-        }) {
-            return Ok(EnqueueOutcome {
-                enqueued: false,
-                entry_id: existing.entry_id.clone(),
-                subject_id,
-            });
         }
 
-        let entry = DispatchQueueEntry::from_dispatch(dispatch);
+        let warning = (dup_count > 0).then(|| {
+            format!(
+                "subject {subject_id} already has {dup_count} queued entr{}; duplicate enqueued",
+                if dup_count == 1 { "y" } else { "ies" }
+            )
+        });
+
+        let entry = DispatchQueueEntry::from_dispatch(dispatch, run_at, expire_after_secs);
         let entry_id = entry.entry_id.clone();
         state.entries.push(entry);
         save_queue_state(&self.project_root, &state)?;
@@ -93,6 +139,7 @@ impl QueueBackend {
             enqueued: true,
             entry_id,
             subject_id,
+            warning,
         })
     }
 
@@ -196,7 +243,11 @@ impl QueueBackend {
             .map_err(QueueLeaseError::Backend)?
             .unwrap_or_default();
 
-        let now_rfc3339 = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        // Drop deferred entries that blew past their expiry window while the
+        // daemon was unavailable, instead of dispatching them late.
+        let swept = sweep_expired_entries(&mut state, now);
+        let now_rfc3339 = now.to_rfc3339();
         let mut leased: Vec<QueueEntry> = Vec::new();
         let mut assigned_index = 0usize;
         let mut exclude_set: Option<std::collections::HashSet<String>> =
@@ -208,6 +259,11 @@ impl QueueBackend {
                 break;
             }
             if entry.status != DispatchQueueEntryStatus::Pending {
+                continue;
+            }
+            // Deferred entry whose run_at has not yet arrived — leave Pending,
+            // not leasable until the instant passes.
+            if entry.is_deferred_until_future(now) {
                 continue;
             }
             // Corrupt legacy state — an entry with no dispatch envelope can't
@@ -252,7 +308,7 @@ impl QueueBackend {
             }
         }
 
-        if !leased.is_empty() {
+        if !leased.is_empty() || swept > 0 {
             save_queue_state(&self.project_root, &state).map_err(QueueLeaseError::Backend)?;
         }
         Ok(QueueLeaseResponse { leased })
@@ -673,10 +729,41 @@ fn entry_to_protocol(entry: &DispatchQueueEntry) -> Option<QueueEntry> {
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         assigned_at: entry.assigned_at.clone(),
         held_at: entry.held_at.clone(),
+        run_at: entry.run_at.clone(),
+        expire_after_secs: entry.expire_after_secs,
     })
 }
 
+/// Remove Pending deferred entries whose expiry window has elapsed (`now`
+/// is past `run_at + expire_after_secs`). Only Pending entries are swept —
+/// an entry already Assigned/Held is in flight and out of scope. Returns
+/// the number of entries dropped so callers know whether to persist.
+fn sweep_expired_entries(
+    state: &mut DispatchQueueState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let before = state.entries.len();
+    state.entries.retain(|entry| {
+        if entry.status != DispatchQueueEntryStatus::Pending {
+            return true;
+        }
+        match entry.expiry_deadline() {
+            Some(deadline) if now > deadline => {
+                tracing::info!(
+                    entry_id = %entry.entry_id,
+                    subject_id = entry.subject_id_ref(),
+                    "queue: expiring deferred entry past its run_at + expire_after_secs window"
+                );
+                false
+            }
+            _ => true,
+        }
+    });
+    before - state.entries.len()
+}
+
 fn stats_from_state(state: &DispatchQueueState) -> QueueStats {
+    let now = Utc::now();
     QueueStats {
         total: state.entries.len(),
         pending: state
@@ -693,6 +780,14 @@ fn stats_from_state(state: &DispatchQueueState) -> QueueStats {
             .entries
             .iter()
             .filter(|entry| entry.status == DispatchQueueEntryStatus::Held)
+            .count(),
+        deferred: state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.status == DispatchQueueEntryStatus::Pending
+                    && entry.is_deferred_until_future(now)
+            })
             .count(),
     }
 }
@@ -724,8 +819,10 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 3, 7, 23, 0, 0).unwrap(),
         );
 
-        let first = backend.enqueue(dispatch.clone()).expect("enqueue");
-        let second = backend.enqueue(dispatch).expect("enqueue");
+        let first = backend
+            .enqueue(dispatch.clone(), None, None)
+            .expect("enqueue");
+        let second = backend.enqueue(dispatch, None, None).expect("enqueue");
 
         assert!(first.enqueued);
         assert!(!second.enqueued);
@@ -741,10 +838,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let backend = QueueBackend::new(temp.path().to_path_buf());
         let first = backend
-            .enqueue(task_dispatch("TASK-1", "standard"))
+            .enqueue(task_dispatch("TASK-1", "standard"), None, None)
             .expect("enqueue first");
         let second = backend
-            .enqueue(task_dispatch("TASK-2", "standard"))
+            .enqueue(task_dispatch("TASK-2", "standard"), None, None)
             .expect("enqueue second");
 
         let hold = backend.hold(&second.entry_id).expect("hold");
@@ -773,7 +870,7 @@ mod tests {
             Utc::now(),
         )
         .with_input(Some(json!({"scope":"shared-ingress"})));
-        let result = backend.enqueue(dispatch).expect("enqueue");
+        let result = backend.enqueue(dispatch, None, None).expect("enqueue");
 
         assert!(result.enqueued);
         let listed = backend.list(&[], None, None).expect("list");
@@ -788,13 +885,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let backend = QueueBackend::new(temp.path().to_path_buf());
         let standard = backend
-            .enqueue(task_dispatch("TASK-1", "standard"))
+            .enqueue(task_dispatch("TASK-1", "standard"), None, None)
             .expect("enqueue standard");
         let _t2 = backend
-            .enqueue(task_dispatch("TASK-2", "standard"))
+            .enqueue(task_dispatch("TASK-2", "standard"), None, None)
             .expect("enqueue second");
         let ops = backend
-            .enqueue(task_dispatch("TASK-1", "ops"))
+            .enqueue(task_dispatch("TASK-1", "ops"), None, None)
             .expect("enqueue ops");
 
         // Reorder both TASK-1 entries to the front (named by entry_id), preserving their requested order.
@@ -823,12 +920,112 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 3, 8, 8, 0, 0).unwrap(),
         );
 
-        let result = backend.enqueue(dispatch).expect("enqueue");
+        let result = backend.enqueue(dispatch, None, None).expect("enqueue");
 
         assert!(result.enqueued);
         assert_eq!(result.subject_id, "pack.review::REV-7");
         let listed = backend.list(&[], None, None).expect("list");
         assert_eq!(listed.entries[0].subject_id, "pack.review::REV-7");
         assert!(listed.entries[0].task_id.is_none());
+    }
+
+    #[test]
+    fn deferred_entry_in_future_is_not_leased() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        let run_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let outcome = backend
+            .enqueue(
+                task_dispatch("TASK-1", "standard"),
+                Some(run_at.clone()),
+                None,
+            )
+            .expect("enqueue");
+        assert!(outcome.enqueued);
+
+        let leased = backend.lease(10, None, None).expect("lease");
+        assert!(leased.leased.is_empty(), "future entry must not be leased");
+
+        let listed = backend.list(&[], None, None).expect("list");
+        assert_eq!(listed.stats.pending, 1);
+        assert_eq!(listed.stats.deferred, 1);
+        assert_eq!(listed.entries[0].run_at.as_deref(), Some(run_at.as_str()));
+    }
+
+    #[test]
+    fn deferred_entry_past_run_at_is_leased() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        let run_at = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        backend
+            .enqueue(task_dispatch("TASK-1", "standard"), Some(run_at), None)
+            .expect("enqueue");
+
+        let leased = backend.lease(10, None, None).expect("lease");
+        assert_eq!(leased.leased.len(), 1, "due entry must be leased");
+        assert_eq!(leased.leased[0].subject_id, "TASK-1");
+    }
+
+    #[test]
+    fn expired_deferred_entry_is_swept_not_leased() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        // run_at well in the past with a tiny grace window → already expired.
+        let run_at = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        backend
+            .enqueue(task_dispatch("TASK-1", "standard"), Some(run_at), Some(60))
+            .expect("enqueue");
+
+        let leased = backend.lease(10, None, None).expect("lease");
+        assert!(leased.leased.is_empty(), "expired entry must not dispatch");
+
+        let listed = backend.list(&[], None, None).expect("list");
+        assert_eq!(listed.stats.total, 0, "expired entry must be swept");
+    }
+
+    #[test]
+    fn deferred_duplicate_subject_is_enqueued_with_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        let first = backend
+            .enqueue(task_dispatch("TASK-1", "standard"), None, None)
+            .expect("enqueue first");
+        assert!(first.enqueued);
+        assert!(first.warning.is_none());
+
+        let run_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let second = backend
+            .enqueue(task_dispatch("TASK-1", "standard"), Some(run_at), None)
+            .expect("enqueue deferred dup");
+        assert!(second.enqueued, "deferred duplicate must still enqueue");
+        assert_ne!(first.entry_id, second.entry_id);
+        let warning = second.warning.expect("duplicate warning");
+        assert!(warning.contains("TASK-1"), "warning names the subject");
+
+        let listed = backend.list(&[], None, None).expect("list");
+        assert_eq!(listed.stats.total, 2);
+    }
+
+    #[test]
+    fn immediate_duplicate_is_idempotent_with_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        let first = backend
+            .enqueue(task_dispatch("TASK-1", "standard"), None, None)
+            .expect("enqueue first");
+        let second = backend
+            .enqueue(task_dispatch("TASK-1", "standard"), None, None)
+            .expect("enqueue second");
+
+        assert!(first.enqueued);
+        assert!(!second.enqueued, "immediate duplicate stays idempotent");
+        assert_eq!(first.entry_id, second.entry_id);
+        assert!(
+            second.warning.is_some(),
+            "idempotent no-op carries a warning"
+        );
+
+        let listed = backend.list(&[], None, None).expect("list");
+        assert_eq!(listed.stats.total, 1);
     }
 }
