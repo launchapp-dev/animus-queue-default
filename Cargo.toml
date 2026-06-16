@@ -1,6 +1,6 @@
 [package]
 name = "animus-queue-default"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Reference queue plugin for Animus v0.5 (lift-and-shift of in-tree dispatch queue + atomic queue/lease + queue/release_pending)"
 license = "MIT OR Apache-2.0"

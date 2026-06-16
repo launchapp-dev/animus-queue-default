@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "animus-queue-default"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "animus-plugin-protocol",
  "animus-queue-protocol",
