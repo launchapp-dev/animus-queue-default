@@ -15,6 +15,8 @@ use animus_subject_protocol::SubjectDispatch;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::identity::{dispatch_legacy_key, dispatch_task_id};
+
 /// Format version written to `queue.json`. Files without the marker (queue
 /// v0.3.3 and older) load as version 0.
 pub const QUEUE_FORMAT_VERSION: u32 = 2;
@@ -183,8 +185,8 @@ impl DispatchQueueEntry {
     ) -> Self {
         Self {
             entry_id: uuid::Uuid::new_v4().to_string(),
-            subject_id: dispatch.subject_key(),
-            task_id: dispatch.task_id().unwrap_or_default().to_string(),
+            subject_id: dispatch_legacy_key(&dispatch),
+            task_id: dispatch_task_id(&dispatch).unwrap_or_default().to_string(),
             dispatch: Some(dispatch),
             status: DispatchQueueEntryStatus::Pending,
             enqueued_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -290,12 +292,13 @@ impl DispatchQueueEntry {
         self.task_id.as_str()
     }
 
-    /// Effective task id (None when this entry's subject is not a built-in
-    /// task).
+    /// Effective task id: the subject id when the subject's kind is
+    /// `animus.task` or `task` (v0.2.9 `entryView`), else the stored
+    /// `task_id` when non-empty.
     pub fn task_id_ref(&self) -> Option<&str> {
         self.dispatch
             .as_ref()
-            .and_then(SubjectDispatch::task_id)
+            .and_then(dispatch_task_id)
             .or_else(|| (!self.task_id.trim().is_empty()).then_some(self.task_id.as_str()))
     }
 }

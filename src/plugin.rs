@@ -29,7 +29,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::host_guard::check_host_protocol;
 use crate::lease_ttl::{lease_ttl_from_env, LEASE_TTL_ENV};
 use crate::queue_service::{
-    QueueBackend, QueueCallError, QueueLeaseError, QueueReleasePendingError,
+    QueueBackend, QueueCallError, QueueLeaseError, QueueMutationError, QueueReleasePendingError,
 };
 
 const PLUGIN_NAME: &str = "animus-queue-default";
@@ -526,7 +526,7 @@ async fn handle_hold(
     };
     match backend.hold(&request.entry_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/hold"),
+        Err(error) => mutation_error_response(id, error, "queue/hold"),
     }
 }
 
@@ -545,7 +545,7 @@ async fn handle_release(
     };
     match backend.release(&request.entry_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/release"),
+        Err(error) => mutation_error_response(id, error, "queue/release"),
     }
 }
 
@@ -574,6 +574,14 @@ async fn handle_release_pending(
             RpcError {
                 code: plugin_error_codes::INVALID_PARAMS,
                 message: format!("entry_id not found: {entry_id}"),
+                data: None,
+            },
+        ),
+        Err(error @ QueueReleasePendingError::Fenced { .. }) => RpcResponse::err(
+            id,
+            RpcError {
+                code: queue_error_codes::QUEUE_STALE_FENCE,
+                message: error.to_string(),
                 data: None,
             },
         ),
@@ -657,7 +665,7 @@ async fn handle_mark_assigned(
         };
     match backend.mark_assigned(&request.entry_id, request.workflow_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/mark_assigned"),
+        Err(error) => mutation_error_response(id, error, "queue/mark_assigned"),
     }
 }
 
@@ -742,19 +750,26 @@ fn to_value_response<T: serde::Serialize>(id: Option<Value>, value: &T) -> RpcRe
     }
 }
 
-fn not_pending_or_internal(id: Option<Value>, error: &anyhow::Error, method: &str) -> RpcResponse {
-    let msg = error.to_string();
-    if msg.contains("not in the expected pre-mutation status") {
-        return RpcResponse::err(
-            id,
-            RpcError {
-                code: queue_error_codes::QUEUE_ENTRY_NOT_PENDING,
-                message: msg,
-                data: None,
-            },
-        );
-    }
-    internal_error_response(id, format!("{method} failed: {error:#}"))
+fn mutation_error_response(
+    id: Option<Value>,
+    error: QueueMutationError,
+    method: &str,
+) -> RpcResponse {
+    let code = match &error {
+        QueueMutationError::NotPending { .. } => queue_error_codes::QUEUE_ENTRY_NOT_PENDING,
+        QueueMutationError::Fenced { .. } => queue_error_codes::QUEUE_STALE_FENCE,
+        QueueMutationError::Backend(error) => {
+            return internal_error_response(id, format!("{method} failed: {error:#}"));
+        }
+    };
+    RpcResponse::err(
+        id,
+        RpcError {
+            code,
+            message: error.to_string(),
+            data: None,
+        },
+    )
 }
 
 fn call_error_response(id: Option<Value>, error: QueueCallError, method: &str) -> RpcResponse {

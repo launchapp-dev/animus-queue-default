@@ -4,6 +4,7 @@
 //! mutations from the in-tree code were replaced as part of the v0.5
 //! plugin extraction (see `docs/architecture/v0.5-protocol-specs.md` §2).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use animus_queue_protocol::{
@@ -18,8 +19,14 @@ use crate::dispatch_queue_state::{
     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state, save_queue_state};
+use crate::identity::{dispatch_legacy_key, MISSING_SUBJECT_IDENTITY};
 use crate::lease_ttl::DEFAULT_LEASE_TTL_SECS;
 use crate::queue_history::{append_history, HistoryOutcome, HistoryRecord};
+
+/// `queue/list` page size when the caller gives none (v0.2.9).
+const DEFAULT_LIST_LIMIT: usize = 500;
+/// Largest `queue/list` page (v0.2.9).
+const MAX_LIST_LIMIT: usize = 2000;
 
 /// File-locked backend wrapping a single project root's queue state.
 #[derive(Debug, Clone)]
@@ -90,11 +97,22 @@ impl QueueBackend {
         // A subjectless entry would make the whole file unreadable for queue
         // v0.3.3 (its dispatch type requires a subject), which breaks the
         // documented rollback path. Reject it before touching state.
-        let Some(subject_id) = dispatch.subject_key() else {
+        let Some(subject_id) = dispatch_legacy_key(&dispatch) else {
             return Err(QueueCallError::InvalidParams(
-                "queue subject identity is missing".to_string(),
+                MISSING_SUBJECT_IDENTITY.to_string(),
             ));
         };
+        // v0.2.9 `parseRunAt`: an unreadable run_at means "dispatch now".
+        let run_at = run_at.filter(|raw| {
+            let readable = chrono::DateTime::parse_from_rfc3339(raw).is_ok();
+            if !readable {
+                tracing::warn!(
+                    run_at = raw.as_str(),
+                    "queue/enqueue: ignoring unparseable run_at; the entry dispatches now"
+                );
+            }
+            readable
+        });
 
         let _lock = acquire_queue_lock(&self.project_root)?;
         let mut state = load_queue_state(&self.project_root)?.unwrap_or_default();
@@ -176,9 +194,7 @@ impl QueueBackend {
         } else {
             filtered.drain(0..offset);
         }
-        if let Some(limit) = limit {
-            filtered.truncate(limit);
-        }
+        filtered.truncate(limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT));
 
         let entries: Vec<QueueEntry> = filtered.into_iter().filter_map(entry_to_protocol).collect();
         Ok(QueueListResponse {
@@ -227,21 +243,21 @@ impl QueueBackend {
     // queue/lease (NEW atomic dispatch path)
     // ============================================================
 
-    /// Atomic dispatch: claim up to `max` pending entries, attach
-    /// workflow ids, transition each Pending → Assigned, persist, and
-    /// return the leased entries.
+    /// Old-style atomic dispatch: claim up to `max` entries, attach workflow
+    /// ids, transition each to Assigned with a lease expiry, persist, and
+    /// return them.
     ///
-    /// If `workflow_ids` is `Some` its length MUST equal `max` (return
-    /// [`QueueLeaseError::WorkflowIdCountMismatch`]). When `None`, synthetic
-    /// UUIDs are generated.
+    /// Follows animus-postgres v0.2.9's `lease`, except that ticketed entries
+    /// are never touched (difference 4):
     ///
-    /// If `exclude_subjects` is `Some`, pending entries whose
-    /// `subject_dispatch.subject_key()` matches any id in the list are
-    /// skipped over without state transition. Daemons pass the set of
-    /// subjects that already have in-flight workflows so the queue can
-    /// advance past a head-of-line entry instead of returning it for
-    /// immediate `queue/release_pending` back to Pending. Backward-
-    /// compatible: `None` matches v0.2.0 behavior.
+    /// - Candidates are due Pending entries and old-style Assigned entries
+    ///   whose lease expired; an expired entry is handed out again.
+    /// - A subject is handed out at most once per call. `exclude_subjects`
+    ///   (legacy subject keys) adds subjects to skip.
+    /// - An entry keeps a workflow id it already has; otherwise the i-th
+    ///   chosen entry gets `workflow_ids[i]`, or a fresh UUID when the caller
+    ///   sent none. If `workflow_ids` is `Some`, its length MUST equal `max`
+    ///   ([`QueueLeaseError::WorkflowIdCountMismatch`]).
     pub fn lease(
         &self,
         max: usize,
@@ -269,23 +285,23 @@ impl QueueBackend {
         // Drop deferred entries that blew past their expiry window while the
         // daemon was unavailable, instead of dispatching them late.
         let finished = sweep_expired_entries(&mut state, now);
-        let now_rfc3339 = now.to_rfc3339();
-        let mut leased: Vec<QueueEntry> = Vec::new();
-        let mut assigned_index = 0usize;
-        let mut exclude_set: Option<std::collections::HashSet<String>> =
-            exclude_subjects.map(|ids| ids.into_iter().collect());
-
-        // FIFO within Pending — first-eligible-wins, in current order.
-        for entry in state.entries.iter_mut() {
-            if leased.len() == max {
+        let mut exclude: HashSet<String> =
+            exclude_subjects.unwrap_or_default().into_iter().collect();
+        let mut chosen: Vec<usize> = Vec::new();
+        for (index, entry) in state.entries.iter().enumerate() {
+            if chosen.len() == max {
                 break;
             }
-            if entry.status != DispatchQueueEntryStatus::Pending {
+            if entry.is_ticketed() {
                 continue;
             }
-            // Deferred entry whose run_at has not yet arrived — leave Pending,
-            // not leasable until the instant passes.
-            if entry.is_deferred_until_future(now) {
+            let due = entry.status == DispatchQueueEntryStatus::Pending
+                && !entry.is_deferred_until_future(now);
+            let expired = entry.status == DispatchQueueEntryStatus::Assigned
+                && entry
+                    .lease_expires_at
+                    .is_some_and(|expires_at| expires_at < now);
+            if !due && !expired {
                 continue;
             }
             // Corrupt legacy state — an entry with no dispatch envelope can't
@@ -294,36 +310,33 @@ impl QueueBackend {
             if entry.dispatch.is_none() {
                 tracing::warn!(
                     entry_id = %entry.entry_id,
-                    "queue/lease: skipping pending entry with no SubjectDispatch envelope"
+                    "queue/lease: skipping entry with no SubjectDispatch envelope"
                 );
                 continue;
             }
-            if let Some(set) = exclude_set.as_mut() {
-                // Prefer the dispatch's canonical subject_key (matches the
-                // host's active-subject tracking); fall back to the stored
-                // subject_id for entries that migrated without a dispatch.
-                let key_owned = entry
-                    .dispatch
-                    .as_ref()
-                    .and_then(SubjectDispatch::subject_key)
-                    .unwrap_or_else(|| entry.subject_id_ref().to_string());
-                if set.contains(&key_owned) {
-                    continue;
-                }
-                // Leasing this entry makes its subject in-flight for the rest
-                // of the batch — otherwise two pending entries for the same
-                // subject can be leased together, defeating the exclusivity
-                // the caller asked for via `exclude_subjects`.
-                set.insert(key_owned);
+            if !exclude.insert(entry.subject_id_ref().to_string()) {
+                continue;
             }
-            let workflow_id = match workflow_ids.as_ref() {
-                Some(ids) => ids[assigned_index].clone(),
-                None => uuid::Uuid::new_v4().to_string(),
-            };
-            assigned_index += 1;
+            chosen.push(index);
+        }
 
+        let expires_at = now + chrono::Duration::seconds(self.lease_ttl_secs);
+        let now_rfc3339 = now.to_rfc3339();
+        let mut leased: Vec<QueueEntry> = Vec::with_capacity(chosen.len());
+        for (slot, index) in chosen.into_iter().enumerate() {
+            let entry = &mut state.entries[index];
+            // v0.2.9: keep a lease's workflow id across expiry and reclaim.
+            // The daemon may already have created that workflow.
+            let workflow_id = entry
+                .workflow_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .or_else(|| workflow_ids.as_ref().map(|ids| ids[slot].clone()))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             entry.status = DispatchQueueEntryStatus::Assigned;
-            entry.workflow_id = Some(workflow_id);
+            entry.workflow_id = Some(workflow_id.clone());
+            entry.lease_owner = Some(workflow_id);
+            entry.lease_expires_at = Some(expires_at);
             entry.assigned_at = Some(now_rfc3339.clone());
             if let Some(protocol_entry) = entry_to_protocol(entry) {
                 leased.push(protocol_entry);
@@ -342,7 +355,10 @@ impl QueueBackend {
     // ============================================================
 
     /// Hold a Pending entry. Idempotent on already-held.
-    pub fn hold(&self, entry_id: &str) -> Result<QueueMutationResponse> {
+    pub fn hold(
+        &self,
+        entry_id: &str,
+    ) -> std::result::Result<QueueMutationResponse, QueueMutationError> {
         self.mutate_entry(entry_id, |entry| {
             match entry.status {
                 DispatchQueueEntryStatus::Held => Ok(false), // idempotent no-op
@@ -358,7 +374,10 @@ impl QueueBackend {
     }
 
     /// Release a Held entry back to Pending. Idempotent on already-pending.
-    pub fn release(&self, entry_id: &str) -> Result<QueueMutationResponse> {
+    pub fn release(
+        &self,
+        entry_id: &str,
+    ) -> std::result::Result<QueueMutationResponse, QueueMutationError> {
         self.mutate_entry(entry_id, |entry| match entry.status {
             DispatchQueueEntryStatus::Pending => Ok(false),
             DispatchQueueEntryStatus::Held => {
@@ -463,27 +482,36 @@ impl QueueBackend {
     // queue/mark_assigned + queue/completion
     // ============================================================
 
-    /// Transition a single Pending entry to Assigned. Used by callers that
-    /// prefer list+mark over atomic [`Self::lease`].
+    /// Transition a single old-style Pending entry to Assigned (v0.2.9
+    /// `markAssigned`). The entry gets `workflow_id`, or a fresh UUID, even
+    /// if it had an id before, plus a lease expiry. Ticketed entries are
+    /// refused with [`QueueMutationError::Fenced`] (difference 4).
     pub fn mark_assigned(
         &self,
         entry_id: &str,
         workflow_id: Option<String>,
-    ) -> Result<QueueMutationResponse> {
-        self.mutate_entry(entry_id, |entry| match entry.status {
-            DispatchQueueEntryStatus::Assigned => Ok(false),
-            DispatchQueueEntryStatus::Pending => {
-                entry.status = DispatchQueueEntryStatus::Assigned;
-                if let Some(wid) = workflow_id {
-                    entry.workflow_id = Some(wid);
-                } else if entry.workflow_id.is_none() {
-                    entry.workflow_id = Some(uuid::Uuid::new_v4().to_string());
-                }
-                entry.assigned_at = Some(Utc::now().to_rfc3339());
-                Ok(true)
+    ) -> std::result::Result<QueueMutationResponse, QueueMutationError> {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(self.lease_ttl_secs);
+        self.mutate_entry(entry_id, |entry| {
+            if entry.is_ticketed() {
+                return Err(MutationError::Fenced);
             }
-            DispatchQueueEntryStatus::Held => Err(MutationError::NotPending),
-            DispatchQueueEntryStatus::Unknown => Err(MutationError::NotPending),
+            match entry.status {
+                DispatchQueueEntryStatus::Assigned => Ok(false),
+                DispatchQueueEntryStatus::Pending => {
+                    let workflow_id =
+                        workflow_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    entry.status = DispatchQueueEntryStatus::Assigned;
+                    entry.workflow_id = Some(workflow_id.clone());
+                    entry.lease_owner = Some(workflow_id);
+                    entry.lease_expires_at = Some(expires_at);
+                    entry.assigned_at = Some(now.to_rfc3339());
+                    Ok(true)
+                }
+                DispatchQueueEntryStatus::Held => Err(MutationError::NotPending),
+                DispatchQueueEntryStatus::Unknown => Err(MutationError::NotPending),
+            }
         })
     }
 
@@ -547,11 +575,13 @@ impl QueueBackend {
     // queue/release_pending
     // ============================================================
 
-    /// Atomically return an Assigned entry to Pending. Clears the workflow
-    /// lease fields and appends an audit entry describing why.
+    /// Atomically return an old-style Assigned entry to Pending. Clears the
+    /// workflow and lease fields and appends an audit entry describing why.
     ///
     /// Errors:
     /// - [`QueueReleasePendingError::NotFound`] when `entry_id` is unknown.
+    /// - [`QueueReleasePendingError::Fenced`] when the entry is ticketed
+    ///   (difference 4; use `queue/v2/release_pending`).
     /// - [`QueueReleasePendingError::NotAssigned`] when the entry exists but
     ///   is in a state other than Assigned. The error carries the entry's
     ///   actual wire status so callers can surface it as the `-32208`
@@ -577,6 +607,11 @@ impl QueueBackend {
                 entry_id: entry_id.to_string(),
             })?;
 
+        if entry.is_ticketed() {
+            return Err(QueueReleasePendingError::Fenced {
+                entry_id: entry_id.to_string(),
+            });
+        }
         if entry.status != DispatchQueueEntryStatus::Assigned {
             return Err(QueueReleasePendingError::NotAssigned {
                 entry_id: entry_id.to_string(),
@@ -589,9 +624,12 @@ impl QueueBackend {
         entry.status = DispatchQueueEntryStatus::Pending;
         entry.assigned_at = None;
         entry.workflow_id = None;
-        // TODO(codex-p2): fence late completions from the released workflow so
-        // they cannot prune the replacement lease on entry id reuse. Requires
-        // touching the completion path (see queue_service.rs completion()).
+        entry.lease_owner = None;
+        entry.lease_expires_at = None;
+        // A late old-style completion from the released workflow can still
+        // finish the entry's next run. That is v0.2.9's behaviour and an
+        // accepted risk for old-style calls (spec §7.3); ticketed work uses
+        // queue/v2/*, which is fenced.
         entry.audit_log.push(DispatchQueueAuditEntry {
             at: now,
             method: "queue/release_pending".to_string(),
@@ -623,7 +661,11 @@ impl QueueBackend {
         save_queue_state(&self.project_root, state)
     }
 
-    fn mutate_entry<F>(&self, entry_id: &str, mutate: F) -> Result<QueueMutationResponse>
+    fn mutate_entry<F>(
+        &self,
+        entry_id: &str,
+        mutate: F,
+    ) -> std::result::Result<QueueMutationResponse, QueueMutationError>
     where
         F: FnOnce(&mut DispatchQueueEntry) -> std::result::Result<bool, MutationError>,
     {
@@ -649,9 +691,14 @@ impl QueueBackend {
         let changed = match mutate(entry) {
             Ok(changed) => changed,
             Err(MutationError::NotPending) => {
-                return Err(anyhow::anyhow!(
-                    "queue entry {entry_id} is not in the expected pre-mutation status"
-                ));
+                return Err(QueueMutationError::NotPending {
+                    entry_id: entry_id.to_string(),
+                });
+            }
+            Err(MutationError::Fenced) => {
+                return Err(QueueMutationError::Fenced {
+                    entry_id: entry_id.to_string(),
+                });
             }
         };
 
@@ -665,11 +712,33 @@ impl QueueBackend {
     }
 }
 
-/// Internal mutation error surfaced to RPC handlers as
-/// `QUEUE_ENTRY_NOT_PENDING`.
+/// Internal outcome of a [`QueueBackend::mutate_entry`] closure.
 #[derive(Debug)]
 enum MutationError {
     NotPending,
+    Fenced,
+}
+
+/// Typed errors for `queue/hold`, `queue/release` and `queue/mark_assigned`.
+#[derive(Debug, thiserror::Error)]
+pub enum QueueMutationError {
+    /// The entry is not in the status the call expects. Surfaced as
+    /// [`animus_queue_protocol::error_codes::QUEUE_ENTRY_NOT_PENDING`].
+    #[error("queue entry {entry_id} is not in the expected pre-mutation status")]
+    NotPending {
+        /// Entry id from the request.
+        entry_id: String,
+    },
+    /// The entry is ticketed; old-style calls may not change it (difference
+    /// 4). Surfaced as [`animus_queue_protocol::error_codes::QUEUE_STALE_FENCE`].
+    #[error("queue entry {entry_id} is owned by a generation-fenced lease; use queue/v2/*")]
+    Fenced {
+        /// Entry id from the request.
+        entry_id: String,
+    },
+    /// Wrapped backend error (I/O, lock acquisition, persistence).
+    #[error(transparent)]
+    Backend(#[from] anyhow::Error),
 }
 
 /// Errors from calls that validate caller input before touching state.
@@ -707,6 +776,13 @@ pub enum QueueReleasePendingError {
     /// invalid_params per the v0.5.1 protocol contract.
     #[error("entry_id not found: {entry_id}")]
     NotFound {
+        /// Entry id from the request.
+        entry_id: String,
+    },
+    /// The entry is ticketed; old-style calls may not change it (difference
+    /// 4). Surfaced as [`animus_queue_protocol::error_codes::QUEUE_STALE_FENCE`].
+    #[error("queue entry {entry_id} is owned by a generation-fenced lease; use queue/v2/*")]
+    Fenced {
         /// Entry id from the request.
         entry_id: String,
     },
