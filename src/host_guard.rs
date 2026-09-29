@@ -61,10 +61,16 @@ pub fn check_host(protocol: Option<&str>, host_version: Option<&str>) -> Result<
     let install_command = format!(
         "animus plugin install launchapp-dev/animus-queue-default@{LEGACY_QUEUE_VERSION} --force"
     );
+    // Below protocol 1.1.0 only the 0.6 generic handshake is left, and its
+    // host_info.version is the plugin-host crate's (`0.1.0`), not Animus's.
+    let old_protocol = protocol_version
+        .as_ref()
+        .is_some_and(|version| *version < MIN_HOST_PROTOCOL_VERSION);
     let host_display = match host_version
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        _ if old_protocol => "0.6 or older".to_string(),
         Some(value) => value.to_string(),
         None => "an unknown version".to_string(),
     };
@@ -145,6 +151,10 @@ mod tests {
         assert!(missing
             .message
             .contains("This Animus is an unknown version (plugin protocol 1.1.0)"));
+        let generic_0_6 = check_host(Some("1.0.0"), Some("0.1.0")).unwrap_err();
+        assert!(generic_0_6
+            .message
+            .contains("This Animus is 0.6 or older (plugin protocol 1.0.0)"));
         let no_protocol = check_host(None, Some("0.6.33")).unwrap_err();
         assert!(no_protocol.message.contains("(plugin protocol not sent)"));
     }
