@@ -134,6 +134,21 @@ pub struct DispatchQueueEntry {
     /// Content hash the idempotency key is bound to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_hash: Option<String>,
+    /// Keys of later ticketed adds that got this entry back instead of a new
+    /// one (difference 3), each with its own content hash. A retry with one of
+    /// them replays this entry's receipt, as v0.2.9 does for every key it has
+    /// accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_idempotency_keys: Vec<IdempotencyBinding>,
+}
+
+/// An idempotency key and the content hash it is bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotencyBinding {
+    /// The producer's idempotency key.
+    pub key: String,
+    /// Content hash of the add that sent it.
+    pub request_hash: String,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -268,11 +283,25 @@ impl DispatchQueueEntry {
 
     /// The instant at which a deferred entry should be expired (dropped
     /// instead of dispatched late): `run_at + expire_after_secs`. `None`
-    /// when the entry is not deferred or has no expiry window.
+    /// when the entry is not deferred, has no expiry window, or the deadline
+    /// is past the latest time a timestamp can hold; such an entry never
+    /// expires.
     pub fn expiry_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         let run_at = self.parsed_run_at()?;
-        let secs = self.expire_after_secs?;
-        Some(run_at + chrono::Duration::seconds(secs as i64))
+        let secs = i64::try_from(self.expire_after_secs?).ok()?;
+        run_at.checked_add_signed(chrono::TimeDelta::try_seconds(secs)?)
+    }
+
+    /// The content hash `key` is bound to on this entry, or `None` when the
+    /// entry doesn't hold `key`.
+    pub fn bound_request_hash(&self, key: &str) -> Option<&str> {
+        if self.idempotency_key.as_deref() == Some(key) {
+            return Some(self.request_hash.as_deref().unwrap_or_default());
+        }
+        self.extra_idempotency_keys
+            .iter()
+            .find(|binding| binding.key == key)
+            .map(|binding| binding.request_hash.as_str())
     }
 
     /// Effective subject id (falls back to `dispatch.subject_id` then to
@@ -416,5 +445,38 @@ mod tests {
         let text = serde_json::to_string(&entry).unwrap();
         let back: DispatchQueueEntry = serde_json::from_str(&text).unwrap();
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn expiry_deadline_never_overflows() {
+        let mut entry = DispatchQueueEntry {
+            run_at: Some("2030-01-01T00:00:00Z".to_string()),
+            expire_after_secs: Some(600),
+            ..DispatchQueueEntry::default()
+        };
+        assert_eq!(
+            entry.expiry_deadline().map(|at| at.to_rfc3339()).as_deref(),
+            Some("2030-01-01T00:10:00+00:00")
+        );
+        for secs in [i64::MAX as u64, u64::MAX, 1 << 53] {
+            entry.expire_after_secs = Some(secs);
+            assert_eq!(entry.expiry_deadline(), None, "{secs} never expires");
+        }
+    }
+
+    #[test]
+    fn idempotency_keys_are_looked_up_on_both_lists() {
+        let entry = DispatchQueueEntry {
+            idempotency_key: Some("key-a".to_string()),
+            request_hash: Some("hash-a".to_string()),
+            extra_idempotency_keys: vec![IdempotencyBinding {
+                key: "key-b".to_string(),
+                request_hash: "hash-b".to_string(),
+            }],
+            ..DispatchQueueEntry::default()
+        };
+        assert_eq!(entry.bound_request_hash("key-a"), Some("hash-a"));
+        assert_eq!(entry.bound_request_hash("key-b"), Some("hash-b"));
+        assert_eq!(entry.bound_request_hash("key-c"), None);
     }
 }

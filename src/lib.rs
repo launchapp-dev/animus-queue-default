@@ -20,6 +20,7 @@
 
 pub mod dispatch_queue_state;
 pub mod dispatch_queue_store;
+pub mod fenced_queue;
 pub mod host_guard;
 pub mod identity;
 pub mod lease_ttl;
@@ -30,6 +31,7 @@ pub mod request_hash;
 
 pub use dispatch_queue_state::{
     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+    IdempotencyBinding,
 };
 pub use dispatch_queue_store::{
     load_queue_state, queue_lock_path, queue_state_path, save_queue_state,
