@@ -801,7 +801,7 @@ pub enum QueueReleasePendingError {
     Backend(anyhow::Error),
 }
 
-fn entry_to_protocol(entry: &DispatchQueueEntry) -> Option<QueueEntry> {
+pub(crate) fn entry_to_protocol(entry: &DispatchQueueEntry) -> Option<QueueEntry> {
     // The wire-level `QueueEntry.subject_dispatch` is required. Entries with
     // no persisted envelope are corrupt legacy state — log + skip them
     // instead of panicking, so callers see a healthy queue minus the

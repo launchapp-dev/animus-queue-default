@@ -4,8 +4,11 @@
 //! seven differences listed in the design spec (§7.2). Each one is marked
 //! where it applies.
 
-use animus_execution_protocol::{RepositoryReservation, SubjectGeneration};
-use animus_queue_protocol::{QueueEnqueueV2Request, QueueEnqueueV2Response};
+use animus_execution_protocol::{ExecutionFence, RepositoryReservation, SubjectGeneration};
+use animus_queue_protocol::{
+    FencedQueueEntry, QueueEnqueueV2Request, QueueEnqueueV2Response, QueueLeaseBlock,
+    QueueLeaseBlockReason, QueueLeaseV2Request, QueueLeaseV2Response,
+};
 use chrono::Utc;
 
 use crate::dispatch_queue_state::{
@@ -14,8 +17,14 @@ use crate::dispatch_queue_state::{
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state};
 use crate::identity::{dispatch_canonical_id, dispatch_task_id};
 use crate::queue_history::find_history_by_idempotency_key;
-use crate::queue_service::{sweep_expired_entries, QueueBackend, QueueCallError};
+use crate::queue_service::{
+    entry_to_protocol, sweep_expired_entries, QueueBackend, QueueCallError,
+};
 use crate::request_hash::enqueue_request_hash;
+
+/// Most entries one `queue/v2/lease` call hands out. Advertised to the host as
+/// `max_lease_batch`; the 0.7 daemon requires at least 5.
+pub const MAX_LEASE_BATCH: usize = 5;
 
 /// Longest accepted idempotency key after trimming (v0.2.9).
 const MAX_IDEMPOTENCY_KEY_CHARS: usize = 256;
@@ -158,6 +167,156 @@ impl QueueBackend {
         })
     }
 
+    /// `queue/v2/lease`: hand out up to `max` (1 to 5) due Pending entries in
+    /// queue order, each with its full execution fence.
+    ///
+    /// Candidates are the first `max(50, max * 10)` due Pending entries.
+    /// Held, deferred and running entries are never handed out, so an entry
+    /// whose ticket expired must be taken over with `queue/v2/lease/recover`.
+    /// A candidate stays where it is and is reported in `blocked` when:
+    ///
+    /// - its subject can't be identified (`missing_execution_identity`);
+    /// - a fence in `exclude` holds the same subject generation
+    ///   (`subject_generation_active`);
+    /// - a fence in `exclude`, or a running entry, holds the same repository
+    ///   and branch (`repository_ref_collision`).
+    ///
+    /// Old-style entries get ticket identity here (difference 5). A handed-out
+    /// entry keeps a workflow id it already has, otherwise it takes the next
+    /// unused id from `workflow_ids`. Its lease generation rises by one.
+    pub fn lease_v2(
+        &self,
+        request: QueueLeaseV2Request,
+    ) -> Result<QueueLeaseV2Response, QueueCallError> {
+        request.validate().map_err(QueueCallError::InvalidParams)?;
+        if request.max > MAX_LEASE_BATCH {
+            return Err(QueueCallError::InvalidParams(
+                "queue v2 lease requires max 1..5, owner_id, and max unique workflow_ids"
+                    .to_string(),
+            ));
+        }
+        let owner_id = request.owner_id.trim().to_string();
+
+        let _lock = acquire_queue_lock(self.project_root())?;
+        let mut state = load_queue_state(self.project_root())?.unwrap_or_default();
+        let now = Utc::now();
+        let finished = sweep_expired_entries(&mut state, now);
+        let candidates: Vec<usize> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.status == DispatchQueueEntryStatus::Pending
+                    && !entry.is_deferred_until_future(now)
+            })
+            .map(|(index, _)| index)
+            .take((request.max * 10).max(50))
+            .collect();
+
+        let expires_at = now + chrono::Duration::seconds(self.lease_ttl_secs());
+        let mut changed = !finished.is_empty();
+        let mut leased = Vec::new();
+        let mut blocked = Vec::new();
+        let mut unused_workflow_ids = request.workflow_ids.iter();
+        for index in candidates {
+            if leased.len() >= request.max {
+                break;
+            }
+            let entry_id = state.entries[index].entry_id.clone();
+            let was_ticketed = state.entries[index].is_ticketed();
+            let identity = if state.entries[index].dispatch.is_some() {
+                ensure_ticket_identity(&mut state, index)
+            } else {
+                Err(format!("queue entry {entry_id} has no dispatch envelope"))
+            };
+            let subject = match identity {
+                Ok(subject) => subject,
+                Err(error) => {
+                    tracing::warn!(
+                        entry_id = %entry_id,
+                        %error,
+                        "queue/v2/lease: entry has no usable subject identity"
+                    );
+                    blocked.push(lease_block(
+                        entry_id,
+                        QueueLeaseBlockReason::MissingExecutionIdentity,
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            changed |= !was_ticketed;
+
+            if let Some(conflict) = request
+                .exclude
+                .iter()
+                .find(|fence| fence.subject.as_ref() == Some(&subject))
+            {
+                blocked.push(lease_block(
+                    entry_id,
+                    QueueLeaseBlockReason::SubjectGenerationActive,
+                    Some(conflict.clone()),
+                ));
+                continue;
+            }
+            if let Some(repository) = state.entries[index].repository.clone() {
+                let key = repository.collision_key();
+                if let Some(conflict) = request.exclude.iter().find(|fence| {
+                    fence
+                        .repository
+                        .as_ref()
+                        .is_some_and(|held| held.collision_key() == key)
+                }) {
+                    blocked.push(lease_block(
+                        entry_id,
+                        QueueLeaseBlockReason::RepositoryRefCollision,
+                        Some(conflict.clone()),
+                    ));
+                    continue;
+                }
+                if let Some(running) = running_entry_on_branch(&state, &key) {
+                    blocked.push(lease_block(
+                        entry_id,
+                        QueueLeaseBlockReason::RepositoryRefCollision,
+                        state.entries[running].execution_fence(),
+                    ));
+                    continue;
+                }
+            }
+
+            let existing_workflow_id = state.entries[index]
+                .workflow_id
+                .clone()
+                .filter(|id| !id.is_empty());
+            let Some(workflow_id) =
+                existing_workflow_id.or_else(|| unused_workflow_ids.next().cloned())
+            else {
+                break;
+            };
+            let entry = &mut state.entries[index];
+            entry.status = DispatchQueueEntryStatus::Assigned;
+            entry.workflow_id = Some(workflow_id);
+            entry.workflow_generation = Some(entry.workflow_generation.unwrap_or(1));
+            entry.lease_owner = Some(owner_id.clone());
+            entry.lease_generation += 1;
+            entry.lease_expires_at = Some(expires_at);
+            entry.assigned_at = Some(now.to_rfc3339());
+            entry.held_at = None;
+            changed = true;
+            leased.push(FencedQueueEntry {
+                entry: entry_to_protocol(entry).expect("checked above: entry has a dispatch"),
+                execution: entry
+                    .execution_fence()
+                    .expect("a just-leased entry has complete ticket identity"),
+            });
+        }
+
+        if changed {
+            self.commit(&state, &finished)?;
+        }
+        Ok(QueueLeaseV2Response { leased, blocked })
+    }
+
     /// The original receipt for `key`, from the live file or, if the entry
     /// already finished, from the history. `swept` holds entries this call's
     /// expiry sweep just removed, which aren't in the history file yet (v0.2.9
@@ -213,6 +372,36 @@ impl QueueBackend {
             warning: None,
         }))
     }
+}
+
+fn lease_block(
+    entry_id: String,
+    reason: QueueLeaseBlockReason,
+    conflicts_with: Option<ExecutionFence>,
+) -> QueueLeaseBlock {
+    QueueLeaseBlock {
+        entry_id,
+        reason,
+        conflicts_with,
+    }
+}
+
+/// The running entry holding the branch with `collision_key`, earliest
+/// assigned first (v0.2.9 orders by `assigned_at`).
+fn running_entry_on_branch(state: &DispatchQueueState, collision_key: &str) -> Option<usize> {
+    state
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.status == DispatchQueueEntryStatus::Assigned
+                && entry
+                    .repository
+                    .as_ref()
+                    .is_some_and(|held| held.collision_key() == collision_key)
+        })
+        .min_by(|(_, left), (_, right)| left.assigned_at.cmp(&right.assigned_at))
+        .map(|(index, _)| index)
 }
 
 /// The live entry that stops a new ticketed add for `qualified_id`
