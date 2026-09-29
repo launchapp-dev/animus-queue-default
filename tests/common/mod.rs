@@ -5,7 +5,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use animus_subject_protocol::{SubjectDispatch, SubjectRef};
+use chrono::Utc;
 use serde_json::{json, Value};
+
+/// A task dispatch requested now.
+pub fn task_dispatch(task_id: &str, workflow_ref: &str) -> SubjectDispatch {
+    SubjectDispatch::for_subject_with_metadata(
+        SubjectRef::task(task_id),
+        workflow_ref,
+        "integration-test",
+        Utc::now(),
+    )
+}
 
 /// A running plugin process driven over stdio, one request at a time.
 pub struct PluginProcess {
