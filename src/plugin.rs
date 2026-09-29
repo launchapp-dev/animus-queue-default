@@ -1,7 +1,8 @@
 //! Stdio JSON-RPC loop for the `animus-queue-default` plugin.
 //!
 //! Handles `initialize`, `$/ping`, `health/check`, `shutdown`, `exit`,
-//! `--manifest` / `--help` CLI shortcuts, and the 10 `queue/*` methods.
+//! `--manifest` / `--help` CLI shortcuts, the old-style `queue/*` methods and
+//! the six ticketed `queue/v2/*` methods.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -21,11 +22,16 @@ use animus_queue_protocol::{
     METHOD_QUEUE_NEXT_DEADLINE, METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING,
     METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS, PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
 };
+use animus_queue_protocol::{
+    METHOD_QUEUE_COMPLETION_V2, METHOD_QUEUE_ENQUEUE_V2, METHOD_QUEUE_LEASE_RECOVER,
+    METHOD_QUEUE_LEASE_RENEW, METHOD_QUEUE_LEASE_V2, METHOD_QUEUE_RELEASE_PENDING_V2,
+};
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::fenced_queue::MAX_LEASE_BATCH;
 use crate::host_guard::check_host_protocol;
 use crate::lease_ttl::{lease_ttl_from_env, LEASE_TTL_ENV};
 use crate::queue_service::{
@@ -35,7 +41,7 @@ use crate::queue_service::{
 const PLUGIN_NAME: &str = "animus-queue-default";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PLUGIN_DESCRIPTION: &str =
-    "Reference queue plugin for Animus v0.5 (file-backed dispatch queue with atomic lease).";
+    "Reference queue plugin for Animus 0.7 (file-backed dispatch queue with generation-fenced leases).";
 
 /// Stable entrypoint for the plugin process. Call from `#[tokio::main]` in
 /// `main.rs`.
@@ -180,6 +186,12 @@ fn queue_methods() -> Vec<&'static str> {
         METHOD_QUEUE_REORDER,
         METHOD_QUEUE_MARK_ASSIGNED,
         METHOD_QUEUE_COMPLETION,
+        METHOD_QUEUE_ENQUEUE_V2,
+        METHOD_QUEUE_LEASE_V2,
+        METHOD_QUEUE_LEASE_RENEW,
+        METHOD_QUEUE_LEASE_RECOVER,
+        METHOD_QUEUE_COMPLETION_V2,
+        METHOD_QUEUE_RELEASE_PENDING_V2,
         "health/check",
     ]
 }
@@ -214,6 +226,66 @@ async fn handle_request(
             Some(handle_mark_assigned(id, request.params, &backend).await)
         }
         METHOD_QUEUE_COMPLETION => Some(handle_completion(id, request.params, &backend).await),
+        METHOD_QUEUE_ENQUEUE_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_ENQUEUE_V2,
+                QueueBackend::enqueue_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_V2,
+                QueueBackend::lease_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_RENEW => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_RENEW,
+                QueueBackend::renew_lease,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_RECOVER => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_RECOVER,
+                QueueBackend::recover_lease,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_COMPLETION_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_COMPLETION_V2,
+                QueueBackend::completion_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_RELEASE_PENDING_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_RELEASE_PENDING_V2,
+                QueueBackend::release_pending_v2,
+            )
+            .await,
+        ),
         other => Some(RpcResponse::err(
             id,
             RpcError {
@@ -288,14 +360,12 @@ async fn handle_initialize(
     *backend.write().await =
         Some(QueueBackend::new(project_root).with_lease_ttl(lease_ttl_from_env()));
 
+    // Identical to animus-postgres v0.2.9 and animus-queue-postgres v0.2.0.
+    // The 0.7 daemon requires the flag and a batch of at least 5.
     let capabilities = QueueCapabilities {
         priority_weighted: false,
-        // No backend-side cap on lease batch size — file-locked state happily
-        // handles batches of any size the daemon's capacity budgeter requests.
-        // Hosts clamp `queue/lease.max` to this value; advertising `u32::MAX`
-        // is the "effectively unlimited" sentinel for the reference plugin.
-        max_lease_batch: u32::MAX,
-        generation_fenced_leases_v1: false,
+        max_lease_batch: MAX_LEASE_BATCH as u32,
+        generation_fenced_leases_v1: true,
     };
     let extra = serde_json::to_value(capabilities).unwrap_or(Value::Null);
     let mut kind_capabilities = std::collections::HashMap::new();
@@ -698,6 +768,38 @@ async fn handle_completion(
                 data: None,
             },
         ),
+    }
+}
+
+// ============================================================
+// queue/v2/*
+// ============================================================
+
+/// Shared handler for the ticketed methods. Params are the protocol's strict
+/// request types (unknown fields are rejected); bad input is `-32602`, and
+/// ticket problems come back as normal outcomes inside the result.
+async fn handle_v2<Req, Resp>(
+    id: Option<Value>,
+    params: Option<Value>,
+    backend: &Arc<RwLock<Option<QueueBackend>>>,
+    method: &str,
+    call: fn(&QueueBackend, Req) -> std::result::Result<Resp, QueueCallError>,
+) -> RpcResponse
+where
+    Req: serde::de::DeserializeOwned,
+    Resp: serde::Serialize,
+{
+    let backend = match require_backend(id.clone(), backend).await {
+        Ok(b) => b,
+        Err(response) => return response,
+    };
+    let request: Req = match parse_params(id.clone(), params, method) {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    match call(&backend, request) {
+        Ok(response) => to_value_response(id, &response),
+        Err(error) => call_error_response(id, error, method),
     }
 }
 
