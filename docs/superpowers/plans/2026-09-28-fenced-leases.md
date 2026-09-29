@@ -17,7 +17,7 @@
 
 **Reference implementation:** `animus-postgres` v0.2.9 `src/queue.ts`. Line numbers cited below refer to that file.
 
-**Provenance:** every code block in Tasks 1–13 was built and tested in a scratch copy of this repo before this plan was written. The finished tree passes `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, 138 tests, and `cargo build --release`. Patches apply in order on top of the spec commit `889d1fb`.
+**Provenance:** every code block in Tasks 1–13 was built and tested in a scratch copy of this repo before this plan was written. The finished tree passes `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, 149 tests, and `cargo build --release`. Patches apply in order on top of the spec commit `889d1fb`.
 
 ## Global Constraints
 
@@ -39,12 +39,12 @@
 - **`queue.json` format:**
   - The file carries `format_version: 2`; a file without it is format 0.
   - A version above 2 is refused.
-  - The file is written atomically (temp file, fsync, rename) and never deleted.
-- **History:** finishing an entry appends and fsyncs its `queue-history.jsonl` line before `queue.json` is replaced. Readers take the first line per `entry_id` and skip unreadable lines.
+  - The file is written atomically (temp file, fsync, rename, then fsync of the `.animus` directory) and never deleted. Creating `.animus` also fsyncs the project root.
+- **History:** finishing an entry appends and fsyncs its `queue-history.jsonl` line before `queue.json` is replaced. Creating the history file fsyncs the directory. Readers take the last line per `entry_id` (an entry never returns once finished, so the last line is the one that took effect) and skip unreadable lines.
 - **Behaviour:** `animus-postgres` v0.2.9 everywhere except:
   1. "Done" and "put back" with an expired ticket are accepted if the owner and numbers still match.
   2. The idempotency hash ignores `dispatch.requested_at`.
-  3. A ticketed add for a task with a waiting, running or held entry returns that entry with a warning.
+  3. A ticketed add for a task with a waiting, running or held entry returns that entry with a warning, and binds the add's idempotency key to it. A running old-style entry doesn't count.
   4. Old-style lease, mark-assigned and put-back touch only old-style entries.
   5. Old entries get ticket identity at their first ticketed hand-out (or when difference 3 returns them).
   6. `ANIMUS_QUEUE_LEASE_TTL_SECS` is declared in the manifest.
@@ -89,11 +89,12 @@
 
 ## Notes on reading the spec
 
-These came up while building the scratch copy. Tests pin notes 1 and 2.
+These came up while building the scratch copy or in review. Tests pin notes 1, 2, 6 and 7.
 
-1. **`expired_lease_recovery_required`:** spec §7.1 names this reason for expired tickets.
+1. **`expired_lease_recovery_required`:** the protocol defines this reason for expired tickets.
    - v0.2.9 never emits it, because `leaseV2` only considers waiting rows. This plan follows v0.2.9: an expired ticket is neither handed out nor listed as blocked.
    - The 0.7 daemon recovers such tasks from its own records with `queue/v2/lease/recover`.
+   - The gap, shared with v0.2.9: if a hand-out reply never reaches the daemon (the queue process is killed after saving, or the daemon crashes before storing the ticket), the daemon has no record, so nobody renews or recovers that entry and it stays `assigned`. The owner kept v0.2.9 behaviour here. The operator workaround is `animus queue drop <task-id>` (the CLI's drop takes a task id and drops every entry for it) and enqueue again (README, Known limitations). Daemon-side recovery of tickets it never received is on the animus-cli follow-up list.
    - Test: `fenced_lease::expired_ticket_is_not_handed_out_again`.
 2. **Renew never moves the expiry earlier** (spec §7.1, §8.2).
    - v0.2.9 sets exactly now + ttl, which could move it earlier only if a caller asked for a shorter `ttl_secs`. The daemon rejects a shortened expiry.
@@ -103,6 +104,10 @@ These came up while building the scratch copy. Tests pin notes 1 and 2.
    - It trims the repository; v0.2.9 doesn't. They agree on every reservation this queue stores, because the ticketed add trims them.
 4. **An empty stored workflow id counts as none** when handing out, as v0.2.9's `resolveLeaseWorkflowId` does for old-style leases.
 5. **Retrying a relative `--at` with an idempotency key:** such a retry computes a new `run_at`, so its content differs and it is refused ("idempotency_key is already bound to a different queue request"). v0.2.9 does the same; difference 2 only drops `requested_at`.
+6. **The old-style add doesn't warn about a ticketed copy.** It compares the old-style key (`TASK-1`) with stored ids, and ticketed entries store `task:TASK-1`. v0.2.9 does exactly the same, and nothing in Animus 0.7 calls the old-style add, so this plan keeps it.
+   - Test: `old_style::old_style_add_does_not_see_a_ticketed_copy`.
+7. **A key is remembered when its add got an existing entry back** (difference 3). v0.2.9 has no difference 3 and binds every accepted key to the entry it created. animus-queue-postgres v0.2.0 forgets such a key, so a retry after the entry finishes would start a new run. The owner chose to keep v0.2.9's promise.
+   - Test: `fenced_enqueue::a_second_key_is_bound_to_the_entry_it_got_back`.
 
 ---
 
@@ -1604,7 +1609,8 @@ The storage change from spec §6.1 and §3.3:
 - **Entry fields:** each entry gains optional ticket fields (subject generation, workflow generation, lease owner/generation/expiry, repository, idempotency key, request hash). All of them are skipped when empty, so old-style entries serialise exactly as in v0.3.3.
 - **Header:** the file gains `format_version` (2) and `subject_generations`, the per-task counters. Counters never decrease.
 - **Load:** refuses a `format_version` above 2.
-- **Save:** writes a temp file, fsyncs it, renames it, and never deletes the file.
+- **Save:** writes a temp file, fsyncs it, renames it, then fsyncs the `.animus` directory so the rename itself survives a machine crash. It never deletes the file.
+- **Creating `.animus`:** `ensure_state_dir` creates it when missing and fsyncs the project root, so the new directory survives too. The lock and the history (Task 6) use the same helper.
 
 `task_id` stays a required string and the status words don't change, so v0.3.3 can still read the file.
 
@@ -1623,6 +1629,9 @@ The storage change from spec §6.1 and §3.3:
   - `DispatchQueueEntry::is_ticketed(&self) -> bool`, which is `subject_generation.is_some()`
   - `DispatchQueueEntry::lease_is_live(&self, now: DateTime<Utc>) -> bool`
   - `DispatchQueueEntry::execution_fence(&self) -> Option<ExecutionFence>` (v0.2.9 `executionFromRow`; `None` unless every part is present)
+- Produces (`src/dispatch_queue_store.rs`):
+  - `pub(crate) fn sync_dir(dir: &Path) -> Result<()>`
+  - `pub(crate) fn ensure_state_dir(project_root: &Path) -> Result<PathBuf>`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2071,7 +2080,10 @@ Replace the whole of `src/dispatch_queue_store.rs` with:
 //! ```
 //!
 //! Writes go to a temp file that is flushed to disk (fsync) and then renamed
-//! over `queue.json`, so readers see either the old or the new state.
+//! over `queue.json`, so readers see either the old or the new state. The
+//! `.animus` directory is flushed after the rename (and the project root when
+//! `.animus` is first created), so the replace also survives a machine crash,
+//! not just a process crash.
 //! Mutations hold an exclusive `fs2` lock across the read-modify-write cycle.
 //! The file is kept even when the queue is empty, because it carries the
 //! per-subject generation counters.
@@ -2100,17 +2112,33 @@ pub fn queue_lock_path(project_root: &Path) -> PathBuf {
     project_root.join(ANIMUS_DIR).join(QUEUE_LOCK_FILE)
 }
 
+/// Flush a directory's entries to disk (fsync), making a rename or file
+/// creation inside it durable.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("failed to flush directory {}", dir.display()))
+}
+
+/// Create `<project_root>/.animus` if it is missing, flushing the project
+/// root so the new directory is durable. Returns the directory's path.
+pub(crate) fn ensure_state_dir(project_root: &Path) -> Result<PathBuf> {
+    let dir = project_root.join(ANIMUS_DIR);
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create animus state dir at {}", dir.display()))?;
+        sync_dir(project_root)?;
+    }
+    Ok(dir)
+}
+
 /// Acquire an exclusive lock on `queue.lock`. Returned guard releases the
 /// lock on drop.
 ///
 /// Held only across read-modify-write cycles, never across IPC.
 pub(crate) fn acquire_queue_lock(project_root: &Path) -> Result<File> {
     let lock_path = queue_lock_path(project_root);
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create animus state dir at {}", parent.display())
-        })?;
-    }
+    ensure_state_dir(project_root)?;
     let file = File::create(&lock_path)
         .with_context(|| format!("failed to open queue lock file at {}", lock_path.display()))?;
     file.lock_exclusive()
@@ -2191,11 +2219,7 @@ fn migrate_missing_entry_ids(state: &mut DispatchQueueState) -> bool {
 /// The file is written even when the queue is empty.
 pub fn save_queue_state(project_root: &Path, state: &DispatchQueueState) -> Result<()> {
     let path = queue_state_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create animus state dir at {}", parent.display())
-        })?;
-    }
+    let dir = ensure_state_dir(project_root)?;
 
     let mut on_disk = state.clone();
     on_disk.format_version = QUEUE_FORMAT_VERSION;
@@ -2219,7 +2243,7 @@ pub fn save_queue_state(project_root: &Path, state: &DispatchQueueState) -> Resu
     })?;
     fs::rename(&tmp_path, &path)
         .with_context(|| format!("failed to publish queue state to {}", path.display()))?;
-    Ok(())
+    sync_dir(&dir)
 }
 
 #[cfg(test)]
@@ -2283,6 +2307,17 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["queue.json".to_string()]);
     }
+
+    #[test]
+    fn state_dir_is_created_once_and_directories_can_be_flushed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = ensure_state_dir(temp.path()).expect("create");
+        assert_eq!(dir, temp.path().join(".animus"));
+        assert!(dir.is_dir());
+        ensure_state_dir(temp.path()).expect("second call is a no-op");
+        sync_dir(&dir).expect("flush");
+        assert!(sync_dir(&temp.path().join("missing")).is_err());
+    }
 }
 ````
 
@@ -2290,7 +2325,7 @@ mod tests {
 
 Run: `cargo test --all-features`
 
-Expected: all tests pass, including `dispatch_queue_store::tests::newer_format_is_refused` and `empty_state_is_written_and_keeps_generation_counters`.
+Expected: all tests pass, including `dispatch_queue_store::tests::newer_format_is_refused` and `empty_state_is_written_and_keeps_generation_counters` and `state_dir_is_created_once_and_directories_can_be_flushed`.
 
 - [ ] **Step 5: Gates and codex review**
 
@@ -2327,7 +2362,7 @@ No `Co-Authored-By`, `Claude-Session` or "Generated with" lines.
 
 ### Task 6: Finished-entry history
 
-Spec §6.1 and §6.2. Finished entries (completed, failed, cancelled, dropped) move to `.animus/queue-history.jsonl`, one JSON line each. The line is appended and fsynced **before** `queue.json` is replaced, so a crash between the two leaves the entry live and the retry finishes it again. Readers take the first line per entry and skip lines that don't parse (for example a torn final write). The history is read only when a call can't find its entry in `queue.json`.
+Spec §6.1 and §6.2. Finished entries (completed, failed, cancelled, dropped) move to `.animus/queue-history.jsonl`, one JSON line each. The line is appended and fsynced **before** `queue.json` is replaced, so a crash between the two leaves the entry live, as if the finish never happened: it can be finished again, dropped or taken over. An entry never comes back once `queue.json` drops it, so its last history line is always the one that took effect. Readers therefore take the **last** line per entry and skip lines that don't parse (for example a torn final write). When the append creates the file, the `.animus` directory is fsynced too. The history is read only when a call can't find its entry in `queue.json`.
 
 The old-style `completion`, `drop` and the expiry sweep now record history through one `commit` helper.
 
@@ -2512,11 +2547,17 @@ Create `src/queue_history.rs`:
 //!
 //! Crash safety: finishing an entry appends and fsyncs its history line
 //! *before* `queue.json` is replaced. A crash in between leaves the entry
-//! live, so the caller's retry finishes it again and appends a second line.
-//! Readers take the first line per entry, and skip lines that don't parse,
-//! such as a torn final write.
+//! live: that finish never happened, as in a rolled-back Postgres
+//! transaction, and the entry can still be finished, dropped or taken over.
+//! Whatever finishes it later appends another line.
+//!
+//! Readers therefore take the **last** line per entry. An entry never
+//! returns to `queue.json` once it leaves, so its last line is always the one
+//! whose `queue.json` replace succeeded; earlier lines are interrupted
+//! attempts. Readers also skip lines that don't parse, such as a torn final
+//! write.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -2526,6 +2567,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch_queue_state::DispatchQueueEntry;
+use crate::dispatch_queue_store::{ensure_state_dir, sync_dir};
 
 const ANIMUS_DIR: &str = ".animus";
 const QUEUE_HISTORY_FILE: &str = "queue-history.jsonl";
@@ -2614,11 +2656,8 @@ pub fn append_history(project_root: &Path, records: &[HistoryRecord]) -> Result<
         return Ok(());
     }
     let path = queue_history_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create animus state dir at {}", parent.display())
-        })?;
-    }
+    let dir = ensure_state_dir(project_root)?;
+    let created = !path.exists();
     let mut payload = String::new();
     for record in records {
         payload.push_str(&serde_json::to_string(record).context("failed to encode history")?);
@@ -2638,7 +2677,12 @@ pub fn append_history(project_root: &Path, records: &[HistoryRecord]) -> Result<
         file.write_all(payload.as_bytes())?;
         file.sync_all()
     };
-    append().with_context(|| format!("failed to append queue history at {}", path.display()))
+    append().with_context(|| format!("failed to append queue history at {}", path.display()))?;
+    if created {
+        // Make the new file's directory entry durable too.
+        sync_dir(&dir)?;
+    }
+    Ok(())
 }
 
 fn ends_without_newline(file: &mut File) -> std::io::Result<bool> {
@@ -2652,25 +2696,25 @@ fn ends_without_newline(file: &mut File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// The first history record for `entry_id`.
+/// The last (authoritative) history record for `entry_id`.
 pub fn find_history_by_entry_id(
     project_root: &Path,
     entry_id: &str,
 ) -> Result<Option<HistoryRecord>> {
-    find_first(project_root, |record| record.entry.entry_id == entry_id)
+    find_last(project_root, |record| record.entry.entry_id == entry_id)
 }
 
-/// The first history record whose entry carried idempotency key `key`.
+/// The last history record whose entry carried idempotency key `key`.
 pub fn find_history_by_idempotency_key(
     project_root: &Path,
     key: &str,
 ) -> Result<Option<HistoryRecord>> {
-    find_first(project_root, |record| {
+    find_last(project_root, |record| {
         record.entry.idempotency_key.as_deref() == Some(key)
     })
 }
 
-fn find_first(
+fn find_last(
     project_root: &Path,
     matches: impl Fn(&HistoryRecord) -> bool,
 ) -> Result<Option<HistoryRecord>> {
@@ -2685,6 +2729,7 @@ fn find_first(
             )));
         }
     };
+    let mut found = None;
     // Split on raw bytes: a torn line may end inside a UTF-8 sequence.
     for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
         let line =
@@ -2693,7 +2738,7 @@ fn find_first(
             continue;
         }
         match serde_json::from_slice::<HistoryRecord>(&line) {
-            Ok(record) if matches(&record) => return Ok(Some(record)),
+            Ok(record) if matches(&record) => found = Some(record),
             Ok(_) => {}
             Err(error) => tracing::warn!(
                 path = %path.display(),
@@ -2703,7 +2748,7 @@ fn find_first(
             ),
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -2765,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn first_record_per_entry_wins() {
+    fn last_record_per_entry_wins() {
         let temp = tempfile::tempdir().expect("tempdir");
         let e1 = entry("e1", None);
         append_history(
@@ -2789,10 +2834,11 @@ mod tests {
         )
         .unwrap();
 
+        // The first line is an interrupted attempt; the last one committed.
         let found = find_history_by_entry_id(temp.path(), "e1")
             .unwrap()
             .unwrap();
-        assert_eq!(found.outcome, HistoryOutcome::Completed);
+        assert_eq!(found.outcome, HistoryOutcome::Failed);
     }
 
     #[test]
@@ -4237,18 +4283,26 @@ v0.2.9's `enqueueV2` (`queue.ts:394-497`) plus differences 2, 3 and 7.
 - **Validation:** protocol validation, then:
   - the id must normalise to a canonical `<kind>:<id>`
   - `run_at` must be RFC 3339 (difference 7)
+  - `expire_after_secs` must fit: `run_at + expire_after_secs` has to be a valid time. v0.2.9 can't store such a value either (its add fails in the database); here it is invalid params
   - the idempotency key is trimmed and at most 256 characters
   - repository fields are trimmed
-- **Idempotency:** the same key with the same content returns the original receipt (`enqueued: false`), from the live file or else from the history. The same key with different content is invalid params.
-- **Difference 3:** if the task already has a waiting, running or held entry, that entry comes back with the warning `subject <id> already has an active generation; enqueue rejected`. If it is an old-style entry, it gets ticket identity then.
+- **Idempotency:** the same key with the same content returns the original receipt (`enqueued: false`), however long ago it was sent. The lookup checks the live file, then entries the expiry sweep removed in this same call (they aren't in the history file yet), then the history. The same key with different content is invalid params. An entry holds its own key plus `extra_idempotency_keys`, see difference 3.
+- **Difference 3:** if the task already has a waiting, running or held entry, that entry comes back with the warning `subject <id> already has an active generation; enqueue rejected`.
+  - The call's idempotency key, with the call's own content hash, is added to that entry's `extra_idempotency_keys`. v0.2.9 binds every key it accepts to the entry it created, so a retry never makes a new run; this keeps that promise when the entry is an existing one.
+  - A waiting or held old-style entry gets ticket identity then (the same set v0.2.9 back-fills at startup).
+  - A running old-style entry doesn't block. v0.2.9 never gives running old entries identity, and after the upgrade the 0.6 daemon that ran it is refused by the guard, so returning it would swallow the add. The add creates a new entry instead, as v0.2.9 and animus-queue-postgres v0.2.0 do, and the old entry keeps its old-style handling.
+- **Expiry arithmetic can't overflow:** `DispatchQueueEntry::expiry_deadline` uses checked arithmetic. An old-style add still stores any `expire_after_secs`, as v0.2.9 does; one no timestamp can hold means "never expires" instead of crashing every later sweep.
 - **Otherwise:** a new entry with the task's next generation. The next generation is one more than the higher of the stored counter and any live entry's generation, and it is recorded.
 
 **Files:**
 
+- Modify: `src/dispatch_queue_state.rs`
 - Create: `src/fenced_queue.rs`
 - Modify: `src/lib.rs`
+- Modify: `src/queue_history.rs`
 - Modify: `tests/common/mod.rs`
 - Create: `tests/fenced_enqueue.rs`
+- Modify: `tests/old_style.rs`
 
 **Interfaces:**
 
@@ -4257,6 +4311,12 @@ v0.2.9's `enqueueV2` (`queue.ts:394-497`) plus differences 2, 3 and 7.
 - Produces (module-private in `src/fenced_queue.rs`, used again by Tasks 9 and 10):
   - `pub(crate) fn ensure_ticket_identity(state: &mut DispatchQueueState, index: usize) -> Result<SubjectGeneration, String>`
   - `fn next_subject_generation(state: &mut DispatchQueueState, qualified_id: &str) -> u64`
+- Produces (`src/dispatch_queue_state.rs`):
+  - `pub struct IdempotencyBinding { pub key: String, pub request_hash: String }`, exported from the crate root
+  - new `DispatchQueueEntry` field `extra_idempotency_keys: Vec<IdempotencyBinding>`, skipped when empty
+  - `DispatchQueueEntry::bound_request_hash(&self, key: &str) -> Option<&str>`: the hash `key` is bound to on this entry, from either list
+  - `expiry_deadline` returns `None` when the deadline overflows
+- Changes (`src/queue_history.rs`): `find_history_by_idempotency_key` matches either list through `bound_request_hash`.
 - Produces (`tests/common/mod.rs`): `reservation(task_id)` and `enqueue_request(task_id)`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4631,6 +4691,195 @@ fn invalid_requests_change_nothing() {
 
     assert!(!temp.path().join(".animus").exists());
 }
+
+#[test]
+fn retry_after_the_entry_expired_returns_the_original_receipt() {
+    // v0.2.9 keeps an expired entry as a `dropped` row, so a retry with the
+    // same key still finds it. Here the sweep and the key check happen in
+    // one call, and the key check must see the entry the sweep just removed.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let request = QueueEnqueueV2Request {
+        run_at: Some("2020-01-01T00:00:00Z".to_string()),
+        expire_after_secs: Some(1),
+        ..enqueue_request("TASK-1")
+    };
+    let first = backend.enqueue_v2(request.clone()).expect("first");
+
+    let retry = backend.enqueue_v2(request).expect("retry");
+
+    assert!(!retry.enqueued);
+    assert_eq!(retry.entry_id, first.entry_id);
+    assert_eq!(backend.stats().expect("stats").total, 0);
+}
+
+#[test]
+fn key_of_a_just_expired_entry_still_rejects_different_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let request = QueueEnqueueV2Request {
+        run_at: Some("2020-01-01T00:00:00Z".to_string()),
+        expire_after_secs: Some(1),
+        ..enqueue_request("TASK-1")
+    };
+    backend.enqueue_v2(request.clone()).expect("first");
+
+    let message = invalid_params(backend.enqueue_v2(QueueEnqueueV2Request {
+        run_at: None,
+        ..request
+    }));
+
+    assert_eq!(
+        message,
+        "idempotency_key is already bound to a different queue request"
+    );
+    // A refused call changes nothing: no new entry, and the expired one is
+    // left for the next call's sweep.
+    assert_eq!(backend.stats().expect("stats").total, 1);
+}
+
+#[test]
+fn a_second_key_is_bound_to_the_entry_it_got_back() {
+    // v0.2.9 binds every key it accepts, forever. Difference 3 only changes
+    // which entry the second key gets; a retry must still replay it.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let first = backend
+        .enqueue_v2(enqueue_request("TASK-1"))
+        .expect("first");
+    let mut second = enqueue_request("TASK-1");
+    second.idempotency_key = Some("second-producer".to_string());
+    let receipt = backend.enqueue_v2(second.clone()).expect("second");
+    assert_eq!(receipt.entry_id, first.entry_id);
+    assert!(receipt.warning.is_some());
+
+    // While the entry is live, and after it finished.
+    let live_retry = backend.enqueue_v2(second.clone()).expect("live retry");
+    assert_eq!(live_retry.entry_id, first.entry_id);
+    assert!(!live_retry.enqueued);
+    assert_eq!(live_retry.warning, None);
+    backend.drop_entry(&first.entry_id).expect("drop");
+    let late_retry = backend.enqueue_v2(second.clone()).expect("late retry");
+    assert!(!late_retry.enqueued);
+    assert_eq!(late_retry.entry_id, first.entry_id);
+    assert_eq!(late_retry.subject, first.subject);
+    assert_eq!(backend.stats().expect("stats").total, 0);
+
+    // The key keeps its own content: different content is refused.
+    second.subject_dispatch = task_dispatch("TASK-1", "review");
+    let message = invalid_params(backend.enqueue_v2(second));
+    assert!(message.contains("already bound"), "{message}");
+}
+
+#[test]
+fn running_old_style_entry_does_not_block_a_ticketed_add() {
+    // v0.2.9 gives old entries identity only while they wait or are held. A
+    // running one belongs to a 0.6 daemon the guard now refuses, so the add
+    // creates a new entry and the old one keeps its old-style handling.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let old = backend
+        .enqueue(task_dispatch("TASK-1", "coding"), None, None)
+        .expect("old-style add");
+    backend
+        .lease(1, Some(vec!["legacy-workflow".to_string()]), None)
+        .expect("old-style lease");
+
+    let added = backend.enqueue_v2(enqueue_request("TASK-1")).expect("add");
+
+    assert!(added.enqueued);
+    assert_ne!(added.entry_id, old.entry_id);
+    assert_eq!(added.subject.generation, 1);
+    assert_eq!(added.warning, None);
+    let old_entry = read_entry(temp.path(), &old.entry_id);
+    assert!(!old_entry.is_ticketed());
+    assert!(old_entry.extra_idempotency_keys.is_empty());
+    backend
+        .release_pending(&old.entry_id, "spawn-deferred")
+        .expect("old-style put-back still works");
+}
+
+#[test]
+fn expiry_that_no_timestamp_can_hold_is_an_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    for secs in [i64::MAX as u64, u64::MAX] {
+        for run_at in [Some("2030-01-01T00:00:00Z"), None] {
+            let mut request = enqueue_request("TASK-1");
+            request.run_at = run_at.map(str::to_string);
+            request.expire_after_secs = Some(secs);
+            let message = invalid_params(backend.enqueue_v2(request));
+            assert!(message.contains("expire_after_secs"), "{message}");
+        }
+    }
+    // A valid number of seconds (about 285,000 years), but run_at plus that
+    // is past the latest time a timestamp holds (year 262143).
+    let mut request = enqueue_request("TASK-1");
+    request.run_at = Some("2030-01-01T00:00:00Z".to_string());
+    request.expire_after_secs = Some(9_000_000_000_000);
+    invalid_params(backend.enqueue_v2(request));
+    assert!(!queue_state_path(temp.path()).exists());
+
+    let mut request = enqueue_request("TASK-1");
+    request.run_at = Some("2030-01-01T00:00:00Z".to_string());
+    request.expire_after_secs = Some(100 * 365 * 24 * 3600);
+    assert!(
+        backend
+            .enqueue_v2(request)
+            .expect("a century fits")
+            .enqueued
+    );
+    backend.next_deadline().expect("sweeps still work");
+}
+```
+
+Apply to `tests/old_style.rs` (`git apply` accepts this patch):
+
+```diff
+diff --git a/tests/old_style.rs b/tests/old_style.rs
+index 545cbeb..3917363 100644
+--- a/tests/old_style.rs
++++ b/tests/old_style.rs
+@@ -353,3 +353,39 @@ fn ticketed_refusal_uses_the_stale_fence_error_code() {
+         .unwrap()
+         .contains("use queue/v2/*"));
+ }
++
++#[test]
++fn oversized_expiry_on_an_old_style_add_never_expires() {
++    // The old-style add stores any expiry, as v0.2.9 does. One no timestamp
++    // can hold means "never expires"; it must not break later calls.
++    let temp = tempfile::tempdir().expect("tempdir");
++    let backend = backend(&temp);
++    for (n, secs) in [i64::MAX as u64, u64::MAX].into_iter().enumerate() {
++        backend
++            .enqueue(
++                task_dispatch(&format!("TASK-{n}"), "coding"),
++                Some("2020-01-01T00:00:00Z".to_string()),
++                Some(secs),
++            )
++            .expect("old-style add");
++    }
++    backend.next_deadline().expect("sweep");
++    assert_eq!(backend.stats().expect("stats").total, 2);
++}
++
++#[test]
++fn old_style_add_does_not_see_a_ticketed_copy() {
++    // v0.2.9 compares the old-style key (`TASK-1`) with stored ids, and
++    // ticketed entries store `task:TASK-1`, so it gives no warning here.
++    // Nothing in Animus 0.7 calls the old-style add.
++    let temp = tempfile::tempdir().expect("tempdir");
++    let backend = backend(&temp);
++    backend
++        .enqueue_v2(common::enqueue_request("TASK-1"))
++        .expect("ticketed add");
++    let added = backend
++        .enqueue(task_dispatch("TASK-1", "coding"), None, None)
++        .expect("old-style add");
++    assert!(added.enqueued);
++    assert_eq!(added.warning, None);
++}
 ```
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -4640,6 +4889,104 @@ Run: `cargo test --test fenced_enqueue`
 Expected: compile error: no method named `enqueue_v2` on `QueueBackend`.
 
 - [ ] **Step 3: Implement**
+
+Apply to `src/dispatch_queue_state.rs` (`git apply` accepts this patch):
+
+```diff
+diff --git a/src/dispatch_queue_state.rs b/src/dispatch_queue_state.rs
+index 89ecc64..2230df8 100644
+--- a/src/dispatch_queue_state.rs
++++ b/src/dispatch_queue_state.rs
+@@ -134,6 +134,21 @@ pub struct DispatchQueueEntry {
+     /// Content hash the idempotency key is bound to.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub request_hash: Option<String>,
++    /// Keys of later ticketed adds that got this entry back instead of a new
++    /// one (difference 3), each with its own content hash. A retry with one of
++    /// them replays this entry's receipt, as v0.2.9 does for every key it has
++    /// accepted.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub extra_idempotency_keys: Vec<IdempotencyBinding>,
++}
++
++/// An idempotency key and the content hash it is bound to.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct IdempotencyBinding {
++    /// The producer's idempotency key.
++    pub key: String,
++    /// Content hash of the add that sent it.
++    pub request_hash: String,
+ }
+ 
+ fn is_zero(value: &u64) -> bool {
+@@ -268,11 +283,25 @@ impl DispatchQueueEntry {
+ 
+     /// The instant at which a deferred entry should be expired (dropped
+     /// instead of dispatched late): `run_at + expire_after_secs`. `None`
+-    /// when the entry is not deferred or has no expiry window.
++    /// when the entry is not deferred, has no expiry window, or the deadline
++    /// is past the latest time a timestamp can hold; such an entry never
++    /// expires.
+     pub fn expiry_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+         let run_at = self.parsed_run_at()?;
+-        let secs = self.expire_after_secs?;
+-        Some(run_at + chrono::Duration::seconds(secs as i64))
++        let secs = i64::try_from(self.expire_after_secs?).ok()?;
++        run_at.checked_add_signed(chrono::TimeDelta::try_seconds(secs)?)
++    }
++
++    /// The content hash `key` is bound to on this entry, or `None` when the
++    /// entry doesn't hold `key`.
++    pub fn bound_request_hash(&self, key: &str) -> Option<&str> {
++        if self.idempotency_key.as_deref() == Some(key) {
++            return Some(self.request_hash.as_deref().unwrap_or_default());
++        }
++        self.extra_idempotency_keys
++            .iter()
++            .find(|binding| binding.key == key)
++            .map(|binding| binding.request_hash.as_str())
+     }
+ 
+     /// Effective subject id (falls back to `dispatch.subject_id` then to
+@@ -417,4 +446,37 @@ mod tests {
+         let back: DispatchQueueEntry = serde_json::from_str(&text).unwrap();
+         assert_eq!(back, entry);
+     }
++
++    #[test]
++    fn expiry_deadline_never_overflows() {
++        let mut entry = DispatchQueueEntry {
++            run_at: Some("2030-01-01T00:00:00Z".to_string()),
++            expire_after_secs: Some(600),
++            ..DispatchQueueEntry::default()
++        };
++        assert_eq!(
++            entry.expiry_deadline().map(|at| at.to_rfc3339()).as_deref(),
++            Some("2030-01-01T00:10:00+00:00")
++        );
++        for secs in [i64::MAX as u64, u64::MAX, 1 << 53] {
++            entry.expire_after_secs = Some(secs);
++            assert_eq!(entry.expiry_deadline(), None, "{secs} never expires");
++        }
++    }
++
++    #[test]
++    fn idempotency_keys_are_looked_up_on_both_lists() {
++        let entry = DispatchQueueEntry {
++            idempotency_key: Some("key-a".to_string()),
++            request_hash: Some("hash-a".to_string()),
++            extra_idempotency_keys: vec![IdempotencyBinding {
++                key: "key-b".to_string(),
++                request_hash: "hash-b".to_string(),
++            }],
++            ..DispatchQueueEntry::default()
++        };
++        assert_eq!(entry.bound_request_hash("key-a"), Some("hash-a"));
++        assert_eq!(entry.bound_request_hash("key-b"), Some("hash-b"));
++        assert_eq!(entry.bound_request_hash("key-c"), None);
++    }
+ }
+```
 
 Create `src/fenced_queue.rs`:
 
@@ -4655,7 +5002,7 @@ use animus_queue_protocol::{QueueEnqueueV2Request, QueueEnqueueV2Response};
 use chrono::Utc;
 
 use crate::dispatch_queue_state::{
-    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState, IdempotencyBinding,
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state};
 use crate::identity::{dispatch_canonical_id, dispatch_task_id};
@@ -4673,9 +5020,13 @@ impl QueueBackend {
     /// - The same idempotency key with the same content returns the original
     ///   receipt (`enqueued: false`); with different content it is an error.
     ///   The content hash leaves out `dispatch.requested_at` (difference 2).
-    /// - A task that already has a live entry gets that entry back, with a
-    ///   warning, instead of a second one (difference 3).
-    /// - A malformed `run_at` is an error (difference 7).
+    /// - A task that already has a waiting or held entry, or a running
+    ///   ticketed one, gets that entry back with a warning instead of a second
+    ///   one (difference 3). The call's idempotency key is bound to that entry,
+    ///   so a retry replays the same receipt. A running old-style entry, left
+    ///   from before the upgrade, doesn't block the add, as in v0.2.9.
+    /// - A malformed `run_at` is an error (difference 7), and so is an
+    ///   `expire_after_secs` whose deadline no timestamp can hold.
     pub fn enqueue_v2(
         &self,
         request: QueueEnqueueV2Request,
@@ -4690,10 +5041,30 @@ impl QueueBackend {
         } = request;
         let qualified_id =
             dispatch_canonical_id(&dispatch).map_err(QueueCallError::InvalidParams)?;
-        if let Some(raw) = run_at.as_deref() {
-            chrono::DateTime::parse_from_rfc3339(raw).map_err(|error| {
-                QueueCallError::InvalidParams(format!("run_at must be RFC 3339 ({raw}): {error}"))
-            })?;
+        let parsed_run_at = run_at
+            .as_deref()
+            .map(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw).map_err(|error| {
+                    QueueCallError::InvalidParams(format!(
+                        "run_at must be RFC 3339 ({raw}): {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        if let Some(secs) = expire_after_secs {
+            let window = i64::try_from(secs)
+                .ok()
+                .and_then(chrono::TimeDelta::try_seconds);
+            let fits = match (window, parsed_run_at) {
+                (Some(window), Some(run_at)) => run_at.checked_add_signed(window).is_some(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !fits {
+                return Err(QueueCallError::InvalidParams(format!(
+                    "expire_after_secs {secs} is too large: run_at + expire_after_secs must be a valid time"
+                )));
+            }
         }
         let idempotency_key = idempotency_key.map(|key| key.trim().to_string());
         if idempotency_key
@@ -4721,7 +5092,7 @@ impl QueueBackend {
         let finished = sweep_expired_entries(&mut state, Utc::now());
 
         if let Some(key) = idempotency_key.as_deref() {
-            if let Some(receipt) = self.idempotent_receipt(&state, key, &request_hash)? {
+            if let Some(receipt) = self.idempotent_receipt(&state, &finished, key, &request_hash)? {
                 if !finished.is_empty() {
                     self.commit(&state, &finished)?;
                 }
@@ -4732,7 +5103,13 @@ impl QueueBackend {
         if let Some(index) = live_entry_for_subject(&state, &qualified_id) {
             let subject =
                 ensure_ticket_identity(&mut state, index).map_err(QueueCallError::InvalidParams)?;
-            let entry_id = state.entries[index].entry_id.clone();
+            let entry = &mut state.entries[index];
+            if let Some(key) = idempotency_key {
+                entry
+                    .extra_idempotency_keys
+                    .push(IdempotencyBinding { key, request_hash });
+            }
+            let entry_id = entry.entry_id.clone();
             self.commit(&state, &finished)?;
             return Ok(QueueEnqueueV2Response {
                 enqueued: false,
@@ -4775,18 +5152,28 @@ impl QueueBackend {
     }
 
     /// The original receipt for `key`, from the live file or, if the entry
-    /// already finished, from the history. Errors when the key is bound to
-    /// different content.
+    /// already finished, from the history. `swept` holds entries this call's
+    /// expiry sweep just removed, which aren't in the history file yet (v0.2.9
+    /// keeps them as `dropped` rows, so its lookup finds them). Errors when
+    /// the key is bound to different content.
     fn idempotent_receipt(
         &self,
         state: &DispatchQueueState,
+        swept: &[crate::queue_history::HistoryRecord],
         key: &str,
         request_hash: &str,
     ) -> Result<Option<QueueEnqueueV2Response>, QueueCallError> {
+        let has_key = |entry: &DispatchQueueEntry| entry.bound_request_hash(key).is_some();
         let live = state
             .entries
             .iter()
-            .find(|entry| entry.idempotency_key.as_deref() == Some(key))
+            .find(|entry| has_key(entry))
+            .or_else(|| {
+                swept
+                    .iter()
+                    .map(|record| &record.entry)
+                    .find(|entry| has_key(entry))
+            })
             .cloned();
         let found = match live {
             Some(entry) => Some(entry),
@@ -4796,7 +5183,7 @@ impl QueueBackend {
         let Some(entry) = found else {
             return Ok(None);
         };
-        if entry.request_hash.as_deref() != Some(request_hash) {
+        if entry.bound_request_hash(key) != Some(request_hash) {
             return Err(QueueCallError::InvalidParams(
                 "idempotency_key is already bound to a different queue request".to_string(),
             ));
@@ -4823,8 +5210,11 @@ impl QueueBackend {
 
 /// The live entry that stops a new ticketed add for `qualified_id`
 /// (difference 3): the ticketed entry with the highest generation, as
-/// animus-queue-postgres v0.2.0 picks, else the first old-style entry for the
-/// same subject in queue order.
+/// animus-queue-postgres v0.2.0 picks, else the first waiting or held
+/// old-style entry for the same subject in queue order. A running old-style
+/// entry never blocks: v0.2.9 gives old entries ticket identity only while
+/// they wait or are held, and after the upgrade the 0.6 daemon that ran it is
+/// refused, so returning it would swallow the add.
 fn live_entry_for_subject(state: &DispatchQueueState, qualified_id: &str) -> Option<usize> {
     let is_live = |entry: &DispatchQueueEntry| entry.status != DispatchQueueEntryStatus::Unknown;
     state
@@ -4840,8 +5230,10 @@ fn live_entry_for_subject(state: &DispatchQueueState, qualified_id: &str) -> Opt
         .map(|(index, _)| index)
         .or_else(|| {
             state.entries.iter().position(|entry| {
-                is_live(entry)
-                    && !entry.is_ticketed()
+                matches!(
+                    entry.status,
+                    DispatchQueueEntryStatus::Pending | DispatchQueueEntryStatus::Held
+                ) && !entry.is_ticketed()
                     && entry
                         .dispatch
                         .as_ref()
@@ -4917,7 +5309,7 @@ Apply to `src/lib.rs` (`git apply` accepts this patch):
 
 ```diff
 diff --git a/src/lib.rs b/src/lib.rs
-index 0bf2d5c..ba64b2b 100644
+index 0bf2d5c..9cafe1f 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -20,6 +20,7 @@
@@ -4928,13 +5320,47 @@ index 0bf2d5c..ba64b2b 100644
  pub mod host_guard;
  pub mod identity;
  pub mod lease_ttl;
+@@ -30,6 +31,7 @@ pub mod request_hash;
+ 
+ pub use dispatch_queue_state::{
+     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
++    IdempotencyBinding,
+ };
+ pub use dispatch_queue_store::{
+     load_queue_state, queue_lock_path, queue_state_path, save_queue_state,
+```
+
+Apply to `src/queue_history.rs` (`git apply` accepts this patch):
+
+```diff
+diff --git a/src/queue_history.rs b/src/queue_history.rs
+index 4cd5650..0b32afc 100644
+--- a/src/queue_history.rs
++++ b/src/queue_history.rs
+@@ -164,13 +164,14 @@ pub fn find_history_by_entry_id(
+     find_last(project_root, |record| record.entry.entry_id == entry_id)
+ }
+ 
+-/// The last history record whose entry carried idempotency key `key`.
++/// The last history record whose entry held idempotency key `key`, as its
++/// own key or a later add's.
+ pub fn find_history_by_idempotency_key(
+     project_root: &Path,
+     key: &str,
+ ) -> Result<Option<HistoryRecord>> {
+     find_last(project_root, |record| {
+-        record.entry.idempotency_key.as_deref() == Some(key)
++        record.entry.bound_request_hash(key).is_some()
+     })
+ }
+ 
 ```
 
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --test fenced_enqueue`
 
-Expected: 14 tests pass.
+Expected: 19 tests pass. `cargo test --all-features` passes too, including two new tests in `tests/old_style.rs` and two new unit tests in `dispatch_queue_state`.
 
 - [ ] **Step 5: Gates and codex review**
 
@@ -5572,7 +5998,7 @@ Apply to `src/fenced_queue.rs` (`git apply` accepts this patch):
 
 ```diff
 diff --git a/src/fenced_queue.rs b/src/fenced_queue.rs
-index d969904..4f64f33 100644
+index a856b94..081ca33 100644
 --- a/src/fenced_queue.rs
 +++ b/src/fenced_queue.rs
 @@ -4,8 +4,11 @@
@@ -5606,7 +6032,7 @@ index d969904..4f64f33 100644
  /// Longest accepted idempotency key after trimming (v0.2.9).
  const MAX_IDEMPOTENCY_KEY_CHARS: usize = 256;
  
-@@ -128,6 +137,156 @@ impl QueueBackend {
+@@ -158,6 +167,156 @@ impl QueueBackend {
          })
      }
  
@@ -5761,9 +6187,9 @@ index d969904..4f64f33 100644
 +    }
 +
      /// The original receipt for `key`, from the live file or, if the entry
-     /// already finished, from the history. Errors when the key is bound to
-     /// different content.
-@@ -175,6 +334,36 @@ impl QueueBackend {
+     /// already finished, from the history. `swept` holds entries this call's
+     /// expiry sweep just removed, which aren't in the history file yet (v0.2.9
+@@ -215,6 +374,36 @@ impl QueueBackend {
      }
  }
  
@@ -5799,7 +6225,7 @@ index d969904..4f64f33 100644
 +
  /// The live entry that stops a new ticketed add for `qualified_id`
  /// (difference 3): the ticketed entry with the highest generation, as
- /// animus-queue-postgres v0.2.0 picks, else the first old-style entry for the
+ /// animus-queue-postgres v0.2.0 picks, else the first waiting or held
 ```
 
 Apply to `src/queue_service.rs` (`git apply` accepts this patch):
@@ -6491,10 +6917,10 @@ Apply to `src/fenced_queue.rs` (`git apply` accepts this patch):
 
 ```diff
 diff --git a/src/fenced_queue.rs b/src/fenced_queue.rs
-index 4f64f33..f82386e 100644
+index 081ca33..94fa12e 100644
 --- a/src/fenced_queue.rs
 +++ b/src/fenced_queue.rs
-@@ -4,19 +4,26 @@
+@@ -4,19 +4,27 @@
  //! seven differences listed in the design spec (§7.2). Each one is marked
  //! where it applies.
  
@@ -6515,8 +6941,9 @@ index 4f64f33..f82386e 100644
 +use chrono::{Duration, Utc};
  
  use crate::dispatch_queue_state::{
--    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+-    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState, IdempotencyBinding,
 +    DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
++    IdempotencyBinding,
  };
  use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state};
  use crate::identity::{dispatch_canonical_id, dispatch_task_id};
@@ -6527,7 +6954,7 @@ index 4f64f33..f82386e 100644
  use crate::queue_service::{
      entry_to_protocol, sweep_expired_entries, QueueBackend, QueueCallError,
  };
-@@ -287,6 +294,240 @@ impl QueueBackend {
+@@ -317,6 +325,240 @@ impl QueueBackend {
          Ok(QueueLeaseV2Response { leased, blocked })
      }
  
@@ -6766,9 +7193,9 @@ index 4f64f33..f82386e 100644
 +    }
 +
      /// The original receipt for `key`, from the live file or, if the entry
-     /// already finished, from the history. Errors when the key is bound to
-     /// different content.
-@@ -334,6 +575,62 @@ impl QueueBackend {
+     /// already finished, from the history. `swept` holds entries this call's
+     /// expiry sweep just removed, which aren't in the history file yet (v0.2.9
+@@ -374,6 +616,62 @@ impl QueueBackend {
      }
  }
  
@@ -7367,7 +7794,8 @@ Spec §8.1's cross-cutting tests. They use the real v0.3.3 release as a renamed 
 
 - **Upgrade:** a file written by v0.3.3 (waiting, held and running entries) loads as it is. The waiting entry gets identity at its first ticketed hand-out. The running entry is finished by the old-style "done". The held entry runs once released.
 - **Rollback:** v0.3.3 lists a v0.4.0 file with every status intact, and can write it. v0.4.0 then reads it back.
-- **Crash:** a history line appended without the `queue.json` replace. The retry is `applied`, a later retry is `already_applied`, and the first line wins.
+- **Crash:** a history line appended without the `queue.json` replace. The retry is `applied`, a later retry is `already_applied`, and the last line wins.
+- **Crash, then takeover:** daemon A's "done" is interrupted after the history append. Its ticket expires and daemon B takes the task over and finishes it. B's retry is `already_applied` with B's ticket, and A's late "done" is `not_assigned`.
 - **Concurrency:** 8 threads and 4 plugin processes lease from one project; no entry is handed out twice. 8 threads adding the same task make one entry.
 
 These tests should pass straight away. If one fails, the defect is in Tasks 5–11, not in this task.
@@ -7417,10 +7845,10 @@ use animus_queue_default::queue_history::{
 };
 use animus_queue_default::{load_queue_state, DispatchQueueEntryStatus, QueueBackend};
 use animus_queue_protocol::{
-    QueueCompletionV2Request, QueueLeaseMutationOutcome, QueueLeaseV2Request, QueueLeaseV2Response,
-    METHOD_QUEUE_LEASE_V2,
+    QueueCompletionV2Request, QueueLeaseMutationOutcome, QueueLeaseRecoverRequest,
+    QueueLeaseV2Request, QueueLeaseV2Response, METHOD_QUEUE_LEASE_V2,
 };
-use common::{enqueue_request, read_entry, PluginProcess};
+use common::{enqueue_request, expire_lease, read_entry, PluginProcess};
 
 fn lease_request(owner: &str, round: usize) -> QueueLeaseV2Request {
     QueueLeaseV2Request {
@@ -7480,7 +7908,7 @@ fn crash_between_history_append_and_file_replace_loses_and_duplicates_nothing() 
         .is_empty());
     assert_eq!(history_lines_for(temp.path(), &entry_id), 2);
 
-    // Readers take the first line, and later retries are acknowledged.
+    // The last line is the committed one, and later retries are acknowledged.
     let record = find_history_by_entry_id(temp.path(), &entry_id)
         .unwrap()
         .unwrap();
@@ -7488,6 +7916,75 @@ fn crash_between_history_append_and_file_replace_loses_and_duplicates_nothing() 
     let again = backend.completion_v2(completion).unwrap();
     assert_eq!(again.outcome, QueueLeaseMutationOutcome::AlreadyApplied);
     assert_eq!(history_lines_for(temp.path(), &entry_id), 2);
+}
+
+#[test]
+fn interrupted_done_then_takeover_leaves_the_new_owner_in_charge() {
+    // Daemon A's "done" appended its history line, then crashed before
+    // queue.json was replaced. Nobody was told the task finished, so it is
+    // still running, as after a rolled-back Postgres transaction. Its ticket
+    // expires, daemon B takes it over and finishes it, and B's retried "done"
+    // must be acknowledged against B's ticket, not A's leftover line.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = QueueBackend::new(temp.path().to_path_buf());
+    backend.enqueue_v2(enqueue_request("TASK-1")).unwrap();
+    let fence_a = backend
+        .lease_v2(lease_request("daemon-a", 0))
+        .unwrap()
+        .leased
+        .remove(0)
+        .execution;
+    let entry_id = fence_a.queue_lease.as_ref().unwrap().entry_id.clone();
+    let entry = read_entry(temp.path(), &entry_id);
+    append_history(
+        temp.path(),
+        &[HistoryRecord::finished(
+            &entry,
+            HistoryOutcome::Completed,
+            "queue/v2/completion",
+            None,
+        )],
+    )
+    .unwrap();
+    expire_lease(temp.path(), &entry_id);
+
+    let recovered = backend
+        .recover_lease(QueueLeaseRecoverRequest {
+            execution: fence_a.clone(),
+            new_owner_id: "daemon-b".to_string(),
+            ttl_secs: None,
+        })
+        .unwrap();
+    assert_eq!(recovered.outcome, QueueLeaseMutationOutcome::Applied);
+    let fence_b = recovered.execution.unwrap();
+    let done = QueueCompletionV2Request {
+        execution: fence_b.clone(),
+        status: "failed".to_string(),
+        workflow_ref: None,
+    };
+    assert_eq!(
+        backend.completion_v2(done.clone()).unwrap().outcome,
+        QueueLeaseMutationOutcome::Applied
+    );
+
+    let retry = backend.completion_v2(done).unwrap();
+
+    assert_eq!(retry.outcome, QueueLeaseMutationOutcome::AlreadyApplied);
+    assert_eq!(retry.execution, Some(fence_b));
+    let record = find_history_by_entry_id(temp.path(), &entry_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.outcome, HistoryOutcome::Failed);
+    assert_eq!(record.entry.lease_owner.as_deref(), Some("daemon-b"));
+    // A's leftover ticket is refused.
+    let late_a = backend
+        .completion_v2(QueueCompletionV2Request {
+            execution: fence_a,
+            status: "completed".to_string(),
+            workflow_ref: None,
+        })
+        .unwrap();
+    assert_eq!(late_a.outcome, QueueLeaseMutationOutcome::NotAssigned);
 }
 
 #[test]
@@ -7816,8 +8313,8 @@ No `Co-Authored-By`, `Claude-Session` or "Generated with" lines.
 
 Spec §9:
 
-- **README:** the compatibility table, the guard and its message, rollback, the ticket-length setting, both storage files and the `.gitignore` note.
-- **Release notes:** the same points, plus the seven differences and the deliberate matches.
+- **README:** the compatibility table, the guard and its message, rollback, the ticket-length setting, both storage files (with the fsync and last-line rules) and the `.gitignore` note. Known limitations include the task left "running" after a lost hand-out reply, with the `animus queue drop` workaround.
+- **Release notes:** the same points, plus the seven differences, the deliberate matches and the known gap.
 - **Crate docs:** the lib.rs doc comment is corrected to match.
 
 **Files:**
@@ -7897,7 +8394,7 @@ In short:
 
 - **Hand-out:** up to 5 entries per call, in queue order. Held entries and entries that aren't due yet are skipped. An entry whose repository branch is already in use is left waiting.
 - **Tickets:** renewing only works while the ticket is valid, and never moves the expiry earlier. A different daemon can take a task over once its ticket has expired. "Done" and "put back" are accepted after expiry as long as nobody took the task over.
-- **Ticketed add:** a task that already has a waiting, running or held entry gets that entry back, with a warning. Resending with the same `idempotency_key` returns the original receipt.
+- **Ticketed add:** a task that already has a waiting, running or held entry gets that entry back, with a warning. Resending with the same `idempotency_key` returns the original receipt. A key is remembered forever, including when its add got an existing entry back. A running entry left over from Animus 0.6 doesn't count, and the add creates a new entry.
 - **Old-style calls:** old-style hand-out, mark-assigned and put-back leave ticketed entries alone. `list`, `stats`, `hold`, `release`, `drop`, `reorder` and `next_deadline` work on every entry. `drop` is the manual escape hatch for a stuck running task.
 
 ### Ticket length
@@ -7912,6 +8409,7 @@ An add may carry `run_at` (RFC 3339) and `expire_after_secs`.
 - A deferred entry still waiting after `run_at + expire_after_secs` is dropped instead of run late.
 - `queue/next_deadline` returns the earliest future `run_at`, so the daemon can wake at exactly that time.
 - A malformed `run_at` is an error on the ticketed add. The old-style add treats it as "now".
+- An `expire_after_secs` too large for `run_at + expire_after_secs` to be a valid time is an error on the ticketed add. The old-style add stores it, and the entry never expires.
 
 ## Storage
 
@@ -7923,8 +8421,8 @@ The plugin binds one project root at `initialize` (`init_extensions.project_bind
 <project_root>/.animus/queue-history.jsonl   one line per finished entry, kept forever
 ```
 
-- `queue.json` is replaced atomically (temp file, fsync, rename) and is never deleted, because its counters must survive.
-- Finishing an entry appends its history line and fsyncs it before `queue.json` is replaced. A crash in between leaves the entry live; the retry finishes it again, and readers use the first history line per entry.
+- `queue.json` is replaced atomically (temp file, fsync, rename, then fsync of `.animus/`) and is never deleted, because its counters must survive. Changes survive a machine crash, not just a process crash.
+- Finishing an entry appends its history line and fsyncs it before `queue.json` is replaced. A crash in between leaves the entry live, as if the finish never happened: it can still be finished, dropped or taken over. Readers use the last history line per entry, which is always the one that took effect.
 - The lock covers both files, so any number of queue processes can work on one project at once.
 
 These are runtime state. Add them to your `.gitignore`:
@@ -7941,6 +8439,7 @@ These are runtime state. Add them to your `.gitignore`:
 - **No change stream.** Poll `queue/list`.
 - **One project root per process.** Re-binding needs a restart.
 - **No Windows build.**
+- **A task can stay "running" if a hand-out reply is lost.** The queue records the hand-out, and then the queue process is killed, or the daemon crashes before saving the ticket. The daemon never learns the ticket, so it can't renew or take over the task. `animus-postgres` has the same gap. The fix belongs in the daemon. Until then, find the task with `animus queue list` (status `assigned`, with no run for it in `animus status`). Remove it with `animus queue drop <task-id>`, which drops every queue entry for that task, then add it again with `animus queue enqueue --task-id <task-id>`.
 
 ## Build
 
@@ -7973,10 +8472,12 @@ The default queue now supports tickets (generation-fenced leases), which the Ani
 - The six ticketed methods: `queue/v2/enqueue`, `queue/v2/lease`, `queue/v2/lease/renew`, `queue/v2/lease/recover`, `queue/v2/completion` and `queue/v2/release_pending`.
 - Capabilities `generation_fenced_leases_v1: true` and `max_lease_batch: 5`, matching the Postgres queues.
 - Ticket length is set with `ANIMUS_QUEUE_LEASE_TTL_SECS` (default 1800, allowed 1 to 604800), declared in the manifest so the host forwards it.
-- Finished entries are kept in `.animus/queue-history.jsonl`. It is written before `queue.json`, so a crash between the two loses nothing and duplicates nothing.
+- Finished entries are kept in `.animus/queue-history.jsonl`. It is written before `queue.json`, so a crash between the two loses nothing and duplicates nothing. Readers use the last line per entry.
+- Every write is flushed to disk, including the folder after each replace, so changes survive a machine crash.
 - `queue.json` gains a format marker and per-task counters. It is never deleted.
 - Old-style `queue/lease` gives entries a 30-minute expiry. Expired old-style entries are handed out again unless the caller lists them in `exclude_subjects`, as in `animus-postgres` v0.2.9.
-- `queue/list` defaults to 500 entries and returns at most 2000.
+- `queue/list` defaults to 500 entries and returns at most 2000. Use `offset` to page.
+- A ticketed add refuses an `expire_after_secs` too large for `run_at + expire_after_secs` to be a valid time. An old-style add stores it, and the entry never expires. Neither can break later calls.
 - Old-style adds without a subject are rejected, because they would make the file unreadable for v0.3.3.
 
 ## Upgrading and rolling back
@@ -7997,7 +8498,7 @@ v0.4.0 behaves like `animus-postgres` v0.2.9 except in these seven places:
 
 1. **"Done" or "put back" with an expired ticket** is accepted if nobody took the task over. v0.2.9 refuses it as stale. The 0.7 daemon renews tickets only while it has a free slot, and after a restart it finishes runs with their stored ticket, so refusing would leave tasks stuck.
 2. **A resent ticketed add** with the same `idempotency_key` ignores `dispatch.requested_at` when comparing content. The CLI stamps a new time on every attempt, and it promises that identical retries return the original receipt.
-3. **A ticketed add for a task that already has a waiting, running or held entry** returns that entry with a warning, as `animus-queue-postgres` v0.2.0 does. v0.2.9 adds a second entry. So a "run later" add for a task that is still waiting or running doesn't queue a second run.
+3. **A ticketed add for a task that already has a waiting, running or held entry** returns that entry with a warning, as `animus-queue-postgres` v0.2.0 does. v0.2.9 adds a second entry. So a "run later" add for a task that is still waiting or running doesn't queue a second run. The add's `idempotency_key` is remembered for the entry it got back, so a retry returns the same receipt, which v0.2.9 promises for every key it accepts. A running entry left over from Animus 0.6 doesn't count: the daemon that ran it can no longer reach this queue, so the add creates a new entry, as v0.2.9 does.
 4. **Old-style hand-out, mark-assigned and put-back** leave ticketed entries alone. A ticketed entry gives mark-assigned and put-back error `-32209`.
 5. **Old entries get ticket identity** at their first ticketed hand-out, not at plugin start.
 6. **The ticket length setting** is declared in the manifest, so it takes effect. v0.2.9 reads it but never declares it, so it always uses 30 minutes.
@@ -8013,6 +8514,11 @@ These match v0.2.9 on purpose:
 - **Old-style "done"** is accepted for any running entry.
 - **A second copy of a task** can be handed out while one runs, and the daemon hands it back. Difference 3 stops new copies from ticketed adds, so these come only from old files or old-style adds.
 - **Each hand-out looks at up to 50 waiting entries** (10 × `max` when that's larger).
+- **An old-style add doesn't warn about a ticketed copy of the task,** because it compares `TASK-1` with the stored `task:TASK-1`. Nothing in Animus 0.7 uses the old-style add.
+
+## Known gap
+
+As with `animus-postgres`, a task can stay "running" if the queue records a hand-out and the reply never reaches the daemon (the queue process is killed, or the daemon crashes before saving the ticket). The daemon can't renew or take over a ticket it never received. Until the daemon handles this, remove it with `animus queue drop <task-id>` (this drops every queue entry for that task) and add it again with `animus queue enqueue --task-id <task-id>`.
 ```
 
 Replace the whole of `src/lib.rs` with:
@@ -8054,6 +8560,7 @@ pub mod request_hash;
 
 pub use dispatch_queue_state::{
     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+    IdempotencyBinding,
 };
 pub use dispatch_queue_store::{
     load_queue_state, queue_lock_path, queue_state_path, save_queue_state,
@@ -8121,52 +8628,92 @@ Expected: both finish. The CLI binary is `~/Animus_projects/animus-cli/target/re
 
 - [ ] **Step 2: Isolated environment**
 
+Resolve every path while `HOME` is still the real one. `~` expands against the current `HOME`, so after the switch it would point into the empty test home.
+
 ```bash
+export REAL_HOME="$HOME"
+export QUEUE_REPO="$REAL_HOME/Animus_projects/animus-queue-default"
+export QUEUE_BIN="$QUEUE_REPO/target/release/animus-queue-default"
+export ANIMUS="$REAL_HOME/Animus_projects/animus-cli/target/release/animus"
 export E2E=$(mktemp -d)
+cp "$REAL_HOME/.local/bin/animus" "$E2E/animus-0.6"   # the installed 0.6.33, for Step 6
+export OLD="$E2E/animus-0.6"
+ls -l "$QUEUE_BIN" "$ANIMUS" "$OLD"                     # all three must exist
+
 export HOME=$E2E/home && mkdir -p "$HOME"
-export ANIMUS=~/Animus_projects/animus-cli/target/release/animus
 export P=$E2E/project && mkdir -p "$P" && cd "$P" && git init -q && git commit -q --allow-empty -m init
 "$ANIMUS" plugin install-defaults --include-subjects
-"$ANIMUS" plugin install --path ~/Animus_projects/animus-queue-default/target/release/animus-queue-default --force
+"$ANIMUS" plugin install --path "$QUEUE_BIN" --force
 "$ANIMUS" plugin install launchapp-dev/animus-workflow-runner-default@v0.4.74 --force
 "$ANIMUS" daemon preflight --project-root "$P"
 ```
 
-Expected: the preflight passes. Before the queue install it would have failed on `generation_fenced_leases_v1`. The runner must be v0.4.69 or newer; the CLI's pin is fixed in part 2. Every later command in this task runs in this shell. Check with `echo $HOME` that you are not using the real home directory.
+Expected: the preflight passes. Before the queue install it would have failed on `generation_fenced_leases_v1`. The runner must be v0.4.69 or newer; the CLI's pin is fixed in part 2. Steps 3–7 run in this shell. Check with `echo $HOME` that you are not using the real home directory. `git commit` in the test project may need `-c user.name=e2e -c user.email=e2e@example.invalid`, because the test home has no git config.
 
-- [ ] **Step 3: A workflow that runs only a shell command (no AI, no cost)**
+- [ ] **Step 3: Workflows that run only a shell command (no AI, no cost)**
 
-Write `$P/.animus/workflows.yaml`:
+Write `$P/.animus/workflows.yaml`. The sleep lengths are written into the workflows on purpose. The host filters the runner's environment, so a variable set in your shell would not reach the command.
 
 ```yaml
 phases:
-  stand-in-work:
+  stand-in-short:
     mode: command
-    directive: Stand-in work for the queue end-to-end test
+    directive: Short stand-in work for the queue end-to-end test
     command:
       program: sh
-      args: ["-c", "sleep ${E2E_SLEEP:-5}; echo done"]
+      args: ["-c", "sleep 5; echo done"]
+      cwd_mode: task_root
+      timeout_secs: 900
+      success_exit_codes: [0]
+  stand-in-long:
+    mode: command
+    directive: Long stand-in work for the queue end-to-end test
+    command:
+      program: sh
+      args: ["-c", "sleep 90; echo done"]
       cwd_mode: task_root
       timeout_secs: 900
       success_exit_codes: [0]
 
 workflows:
-  - id: e2e-shell
-    name: E2E shell only
+  - id: e2e-short
+    name: E2E shell only, 5 seconds
     phases:
-      - stand-in-work
+      - stand-in-short
+  - id: e2e-long
+    name: E2E shell only, 90 seconds
+    phases:
+      - stand-in-long
 ```
 
-If `animus workflow` validation rejects a field, load the `animus-workflow-authoring` skill and fix the YAML. The only goal is a phase that runs `sh`.
+If `animus workflow` validation rejects a field, load the `animus-workflow-authoring` skill and fix the YAML. The only goal is phases that run `sh` for a fixed time.
+
+Add a helper that prints each live entry's ticket and each history line:
+
+```bash
+show() { python3 - "$P" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+q = json.load(open(f"{root}/.animus/queue.json"))
+for e in q["entries"]:
+    print("live   ", e["task_id"], e["status"], "assigned", e.get("assigned_at"), "expires", e.get("lease_expires_at"))
+h = f"{root}/.animus/queue-history.jsonl"
+if os.path.exists(h):
+    for line in open(h):
+        r = json.loads(line)
+        print("history", r["entry"]["task_id"], r["outcome"], "finished", r["finished_at"], "ticket expiry", r["entry"].get("lease_expires_at"))
+PY
+}
+```
 
 - [ ] **Step 4: The basic path**
 
 ```bash
 "$ANIMUS" subject create --kind task --title "e2e one" --project-root "$P"      # note the TASK id
-"$ANIMUS" queue enqueue --task-id <TASK-ID> --workflow-ref e2e-shell --project-root "$P"
+"$ANIMUS" queue enqueue --task-id <TASK-ID> --workflow-ref e2e-short --project-root "$P"
 "$ANIMUS" daemon start --project-root "$P"
 "$ANIMUS" queue list --project-root "$P"
-cat "$P/.animus/queue.json"; cat "$P/.animus/queue-history.jsonl"
+show; cat "$P/.animus/queue.json"
 ```
 
 Expected:
@@ -8181,22 +8728,27 @@ If the CLI's enqueue flags differ, load `animus-queue-management` before retryin
 
 Run each case and write down what happened for the PR description:
 
-1. **Restart mid-run:** `E2E_SLEEP=60`, enqueue, then `daemon stop` while it runs, then `daemon start`. The run finishes and the entry closes. No `stale_fence` for a run nobody took over.
-2. **Ticket expiry:** stop the daemon, restart it with `ANIMUS_QUEUE_LEASE_TTL_SECS=20` and `E2E_SLEEP=90`. The run completes. The entry ends in history as `completed`, not stuck `assigned`.
-3. **Dropping a running task:** `animus queue drop <entry-id>` during a run. The daemon logs a `not_assigned` warning when the run ends. Nothing crashes, and the next task still runs.
+1. **Restart mid-run:** enqueue a task with `e2e-long`, then `daemon stop` while it runs, then `daemon start`. The run finishes and the entry closes. No `stale_fence` for a run nobody took over.
+2. **Short tickets are renewed:** stop the daemon and start it again as `ANIMUS_QUEUE_LEASE_TTL_SECS=20 "$ANIMUS" daemon start --project-root "$P"`. Enqueue one task with `e2e-long`.
+   - About 10 seconds in, `show` must print an expiry about 20 seconds after `assigned`. If it is 30 minutes after, the setting never reached the queue: stop and find out why before going on.
+   - Run `show` again 30 seconds later: the expiry has moved forward, because the daemon renews while it has a free slot.
+   - The run completes, and history shows `completed`, not a task stuck `assigned`.
+3. **Dropping a running task:** during an `e2e-long` run, `"$ANIMUS" queue drop <TASK-ID> --project-root "$P"`. The CLI's drop takes the task id, not the entry id. The daemon logs a `not_assigned` warning when the run ends. Nothing crashes, and the next task still runs.
 4. **Queuing the same task twice:** the second enqueue returns the same entry with the warning `subject task:<id> already has an active generation; enqueue rejected`.
-5. **A run that outlives its ticket while every slot is busy** (difference 1): `ANIMUS_QUEUE_LEASE_TTL_SECS=20`, enqueue at least as many tasks as the daemon's pool size with `E2E_SLEEP=90`. Every run's "done" is `applied`, and nothing is left `assigned`.
+5. **A run that outlives its ticket while every slot is busy** (difference 1). Keep the 20-second tickets and set `"$ANIMUS" daemon config --pool-size 2 --project-root "$P"`. Enqueue two tasks with `e2e-long`.
+   - About 60 seconds in, run `show` and note each entry's expiry: it must already be in the past. With every slot busy the daemon doesn't renew, which is the case difference 1 exists for. If the expiries are still in the future, the case isn't being exercised: stop and find out why.
+   - After both runs end, `show` must list both as `completed`, each with `finished` later than its `ticket expiry`. `daemon stream` shows no `stale_fence`, and nothing is left `assigned`.
 
 - [ ] **Step 6: Old CLI refused (installed 0.6.33, isolated HOME)**
 
 ```bash
 export HOME=$E2E/old-home && mkdir -p "$HOME"
-export OLD=~/.local/bin/animus && "$OLD" --version          # 0.6.33
+"$OLD" --version                                             # 0.6.33
 export Q=$E2E/old-project && mkdir -p "$Q" && cd "$Q" && git init -q && git commit -q --allow-empty -m init
 "$OLD" plugin install-defaults
 "$OLD" queue enqueue --task-id TASK-1 --project-root "$Q"    # writes a v0.3.3 queue.json
 shasum "$Q/.animus/queue.json" > "$E2E/before.sha"
-"$OLD" plugin install --path ~/Animus_projects/animus-queue-default/target/release/animus-queue-default --force
+"$OLD" plugin install --path "$QUEUE_BIN" --force
 "$OLD" queue list --project-root "$Q"
 shasum -c "$E2E/before.sha"
 ```
@@ -8216,14 +8768,17 @@ Expected: the list works again. Use the exact working command in the README and 
 
 - [ ] **Step 7: Rollback with the real 0.6.33**
 
-Copy a `queue.json` written by v0.4.0 in Steps 4–5 (with a held entry: `animus queue hold <entry-id>` first) into `$Q/.animus/`, then run `"$OLD" queue list --project-root "$Q"`.
+Copy a `queue.json` written by v0.4.0 in Steps 4–5 (with a held entry: enqueue a task and run `"$ANIMUS" queue hold <TASK-ID> --project-root "$P"` first; hold takes the task id) into `$Q/.animus/`, then run `"$OLD" queue list --project-root "$Q"`.
 
 Expected: waiting and held entries are listed with their statuses.
 
 - [ ] **Step 8: Final gates**
 
+Leave the isolated environment first: git, cargo and `gh` read their settings from the real home.
+
 ```bash
-cd ~/Animus_projects/animus-queue-default
+"$ANIMUS" daemon stop --project-root "$P" 2>/dev/null
+export HOME="$REAL_HOME" && cd "$QUEUE_REPO"
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all-features && cargo build --release
 git status --short   # must be empty
 ```
@@ -8241,7 +8796,7 @@ The body covers:
 - what changed
 - the compatibility table
 - the seven differences
-- the five notes from "Notes on reading the spec"
+- the seven notes from "Notes on reading the spec"
 - the Step 4–7 results
 - that `main` is one commit behind `v0.3.3`, and this PR carries that commit
 

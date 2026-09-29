@@ -204,7 +204,7 @@ No 0.7 code calls the old-style `enqueue`, `lease`, `mark_assigned` or `release_
 - **Also stored:**
   - a format version marker
   - each task's highest generation so far, which never decreases
-- **Writing:** atomically (temp file plus rename) under `.animus/queue.lock`, as today.
+- **Writing:** atomically under `.animus/queue.lock`, as today: temp file, fsync, rename, then fsync of the `.animus` directory so the rename survives a machine crash. Creating `.animus` fsyncs the project root; creating the history file fsyncs `.animus`.
 - **Not deleted when empty,** because the counters must survive.
 - **Ticket fields** on new-style entries:
   - subject and subject generation
@@ -225,7 +225,11 @@ When a task finishes:
 1. Append the history line and flush it (fsync).
 2. Atomically replace `queue.json`.
 
-If the process crashes between the two, the entry is still live. The daemon's retry finishes it again, and readers ignore the duplicate history line by de-duplicating on `entry_id`.
+If the process crashes between the two, the entry is still live, as if the finish never happened. It behaves like any live entry: the daemon's retry finishes it again, an operator can drop it, and once its ticket expires another daemon can take it over and finish it.
+
+That can leave more than one history line for an entry. Readers take the **last** line per `entry_id`. An entry never returns to `queue.json` once it leaves, so the last line is always the one that took effect; earlier lines belong to finishes that never completed.
+
+The idempotency check of a ticketed add also looks at entries the expiry sweep removed in the same call, because their history lines aren't readable until the call commits.
 
 ### 6.3 Concurrency
 
@@ -235,7 +239,7 @@ The daemon starts a fresh queue process for every call. The single file lock aro
 
 - The file loads as it is. A file without the version marker is treated as the v0.3.3 format, and its per-task counters start at zero.
 - Waiting and held entries stay old-style until their first ticketed hand-out gives them ticket identity (difference 5).
-- Running (`assigned`) entries stay old-style. The old-style "done" finishes them, or an operator can drop them.
+- Running (`assigned`) entries stay old-style. The old-style "done" finishes them, or an operator can drop them. They don't block a ticketed add for the same task (§7.2, difference 3).
 
 ### 6.5 Task IDs
 
@@ -254,19 +258,20 @@ Anything not listed in §7.2 behaves like `animus-postgres` v0.2.9's `src/queue.
 
 **Add, ticketed (`queue/v2/enqueue`):**
 
-- **Same idempotency key and same content:** returns the original receipt and adds nothing.
+- **Same idempotency key and same content:** returns the original receipt and adds nothing, however long ago the key was first sent. A key stays bound to its entry for good, including a key whose add got an existing entry back (difference 3).
 - **Same key, different content:** error.
-- **Task already waiting, running or held:** returns the existing entry with a warning (difference 3).
+- **Task already waiting, running or held:** returns the existing entry with a warning (difference 3). A running old-style entry doesn't count.
 - **Malformed `run_at`:** error (difference 7).
+- **`expire_after_secs` too large:** error when `run_at + expire_after_secs` isn't a valid time. v0.2.9 can't store such a value either; its add fails in the database.
 - **Otherwise:** a new entry with the task's next generation and a normalised ID.
 
-**Add, old-style:** as v0.2.9, and as v0.3.3 does today. It always adds a new entry and warns about duplicates.
+**Add, old-style:** as v0.2.9, and as v0.3.3 does today. It always adds a new entry and warns about duplicates. Like v0.2.9, it looks for duplicates by the old-style key (`TASK-1`), so it doesn't notice a ticketed copy (`task:TASK-1`). An expiry too large to hold is stored and means the entry never expires; it must never break later calls.
 
 **Hand out, ticketed (`queue/v2/lease`):**
 
 - **Batch:** up to 5 per call, in queue order, skipping held entries and entries that aren't due yet.
 - **Skips an entry whose git branch collides** with a running entry or with one of the caller's active tickets. The collision key is `lowercase(trim(repo)) + "\n" + head_ref`.
-- **Expired tickets:** never handed out fresh. They must be taken over first (`expired_lease_recovery_required`).
+- **Expired tickets:** never handed out fresh, and not listed in the hand-out's `blocked` list. They come back only through a takeover (`queue/v2/lease/recover`). v0.2.9 defines the reason `expired_lease_recovery_required`, but its hand-out only looks at waiting entries, so it never reports one; see §7.3.
 - **Old-style waiting entries** get ticket identity at this point (difference 5).
 - **Second copies:** a second copy of a task can be handed out while another copy is running; the daemon hands it back.
 
@@ -321,6 +326,8 @@ Anything not listed in §7.2 behaves like `animus-postgres` v0.2.9's `src/queue.
 - **v0.4.0:** returns the existing entry with a warning.
 - **Why:** the owner's choice, and it matches `animus-queue-postgres` v0.2.0 (`store/mod.rs:370-450`).
 - **Consequence:** a "run later" add for a task that is still waiting or running doesn't queue a second run.
+- **The add's idempotency key is bound to the entry it gets back,** with the add's own content hash. v0.2.9 binds every key it accepts to the entry it created, so retrying a key never starts a second run. queue-postgres v0.2.0 forgets such a key; the owner chose to keep v0.2.9's promise.
+- **A running old-style entry doesn't count.** v0.2.9 gives old entries identity only while they wait or are held (`queue.ts:247`). After the upgrade, the 0.6 daemon that ran such an entry is refused by the guard, so returning it would swallow the add for good. The add creates a new entry, as v0.2.9 and queue-postgres v0.2.0 do.
 
 **4. Old-style hand-out, mark-assigned or put-back on ticketed entries**
 
@@ -355,6 +362,8 @@ These were each considered and kept as v0.2.9 does them:
 - **"Done" for a task an operator dropped gets `NotAssigned`.** The 0.7 daemon then keeps a leftover local record and warns at each restart. The record no longer takes up a slot (TASK-1332).
 - **A second copy of a task can be handed out while one runs,** and the daemon hands it back each cycle. Difference 3 stops new duplicates from the ticketed add, so these copies come only from old files or old-style adds.
 - **A repeated "done" with a different outcome** is acknowledged, and the first outcome is kept.
+- **The old-style add doesn't notice a ticketed copy of the task** (see §7.1). Nothing in Animus 0.7 calls the old-style add.
+- **Expired tickets aren't reported by the hand-out.** The 0.7 daemon takes over tasks it has records for. Accepted risk, shared with v0.2.9: if a hand-out reply never reaches the daemon (the queue process is killed after saving, or the daemon crashes before storing the ticket), nobody holds a record, so the entry stays `assigned` until an operator drops it. The README documents the workaround (`animus queue drop <task-id>`, which drops every entry for that task, then enqueue again), and §10 moves the real fix into the daemon.
 
 ## 8. Testing and verification
 
@@ -369,6 +378,11 @@ These were each considered and kept as v0.2.9 does them:
    - One test for each difference in §7.2, plus checks that §7.1 and §7.3 match v0.2.9.
    - Upgrading from a real v0.3.3 `queue.json`.
    - A crash between the history append and the file replace: nothing is lost or duplicated.
+   - A second add's idempotency key replays the entry it got back, before and after that entry finishes.
+   - A running old-style entry doesn't block a ticketed add, and keeps its old-style put-back.
+   - An `expire_after_secs` too large to hold: an error on the ticketed add; on the old-style add the entry never expires and later calls still work.
+   - The same crash followed by a takeover: the new owner's finish stands, its retry is `already_applied` with its own ticket, and the first owner's late "done" is refused.
+   - A resent ticketed add whose original entry expired in the same call still returns the original receipt, and a different add with that key is still refused.
    - Many queue processes working on one project at once: no task is ever handed out twice.
    - The guard:
      - `initialize` with protocol `1.0.0`, a missing version or an unparseable one is refused, and the queue files aren't touched.
@@ -383,14 +397,14 @@ These were each considered and kept as v0.2.9 does them:
      - `FencedQueueEntry::validate` passes
 3. **End-to-end test with an isolated `HOME`,** never the real `~/.animus`:
    - Build the 0.7 CLI from source. Install this queue, a fenced runner (v0.4.69 or newer; part 2 fixes the pin) and the other default plugins.
-   - Use a workflow that runs only a shell command, so there's no AI and no cost.
+   - Use workflows that run only a shell command, so there's no AI and no cost. Write the sleep lengths into the workflows: the host filters the runner's environment, so a variable set in the shell won't reach the command.
    - **Basics:** preflight passes, the daemon starts, and a queued task is handed out, runs and is marked done.
    - **Hard cases:**
      - a restart mid-run
-     - a ticket expiring (use a short ticket length)
-     - dropping a running task
+     - short tickets being renewed (check the expiry moves forward, which also proves the ticket-length setting reached the queue)
+     - dropping a running task (the CLI's `queue drop` takes a task id)
      - queuing the same task twice
-     - a run that outlives its ticket while all slots are busy, which exercises difference 1
+     - a run that outlives its ticket while all slots are busy, which exercises difference 1. Check the ticket really had expired before the run finished; otherwise the case wasn't exercised
 4. **Old-version checks with the installed `animus` 0.6.33,** also with an isolated `HOME`:
    - Queue v0.4.0 refuses with the §3.2 message, and the queue file is unchanged.
    - The recovery command in the message restores v0.3.3, and the queue works again. This fixes the message's final wording.
@@ -415,14 +429,18 @@ These were each considered and kept as v0.2.9 does them:
   - the rollback procedure
   - the ticket-length setting
   - both storage files, with a note to add `.animus/queue.json`, `.animus/queue.lock` and `.animus/queue-history.jsonl` to `.gitignore`, since they are runtime state
-- **v0.4.0 release notes:** the same points, plus the seven differences.
+  - a known limitation: a task can stay running after a lost hand-out reply, with the workaround `animus queue drop <task-id>` and enqueue again
+- **v0.4.0 release notes:** the same points, plus the seven differences and the known gap.
 - **animus-cli docs:** the same compatibility note, done in part 2.
 
 ## 10. Follow-ups outside this spec
 
 - **Part 2 (animus-cli):**
   - Raise the pins, check capabilities in preflight, add the CI check, fix the docs, and publish a Latest release.
+  - Page through `queue/list`. The CLI reads one page with the default limit, so with more than 500 matching entries `hold`, `release`, `drop` and `--all` miss the rest. The same happens with `animus-postgres` today. The queue already honours `offset`.
+  - Match IDs the same way everywhere. `queue reorder` compares IDs exactly, so `TASK-1` doesn't match the stored `task:TASK-1`; `hold`, `release` and `drop` already accept both forms.
   - Consider renewing tickets even when the pool is full. That is the root cause of difference 1's everyday case.
+  - Recover tickets the daemon never received. After a lost hand-out reply the queue has a running entry the daemon has no record of. Two options: the daemon records its intent before asking for a hand-out and reconciles afterwards, or the queue lists expired tickets (for example as `expired_lease_recovery_required`) and the daemon takes them over. Either needs a daemon change, and would apply to `animus-postgres` too.
 - **Runner:** optionally add the same guard to `animus-workflow-runner-default`.
   - Newer runners are already public; v0.4.74 has been GitHub's "Latest" since 2026-09-07.
   - A quick read suggests they tolerate 0.6.x hosts, since the fence is optional, but this isn't verified end to end.
