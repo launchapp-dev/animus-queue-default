@@ -20,8 +20,10 @@
 
 pub mod dispatch_queue_state;
 pub mod dispatch_queue_store;
+pub mod identity;
 pub mod plugin;
 pub mod queue_service;
+pub mod request_hash;
 
 pub use dispatch_queue_state::{
     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
