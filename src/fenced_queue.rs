@@ -225,7 +225,7 @@ impl QueueBackend {
         let mut changed = !finished.is_empty();
         let mut leased = Vec::new();
         let mut blocked = Vec::new();
-        let mut unused_workflow_ids = request.workflow_ids.iter();
+        let mut unused_workflow_ids = request.workflow_ids.iter().peekable();
         for index in candidates {
             if leased.len() >= request.max {
                 break;
@@ -296,8 +296,11 @@ impl QueueBackend {
                 .workflow_id
                 .clone()
                 .filter(|id| !id.is_empty());
+            // A fresh id is only used up once the hand-out succeeds, so a
+            // damaged entry below can't take the slot's id from the next one.
+            let takes_fresh_id = existing_workflow_id.is_none();
             let Some(workflow_id) =
-                existing_workflow_id.or_else(|| unused_workflow_ids.next().cloned())
+                existing_workflow_id.or_else(|| unused_workflow_ids.peek().map(|id| (*id).clone()))
             else {
                 break;
             };
@@ -327,6 +330,9 @@ impl QueueBackend {
                 ));
                 continue;
             };
+            if takes_fresh_id {
+                unused_workflow_ids.next();
+            }
             changed = true;
             leased.push(FencedQueueEntry {
                 entry: entry_to_protocol(entry).expect("checked above: entry has a dispatch"),

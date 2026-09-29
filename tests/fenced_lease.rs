@@ -520,6 +520,26 @@ fn damaged_ticket_identity_is_blocked_instead_of_crashing() {
 }
 
 #[test]
+fn damaged_entry_at_the_head_does_not_use_up_the_workflow_id() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let damaged = add(&backend, "TASK-1");
+    let other = add(&backend, "TASK-2");
+    edit_state(temp.path(), |state| {
+        common::entry_mut(state, &damaged).workflow_generation = Some(0);
+    });
+
+    // One slot, one workflow id: the damaged head must not swallow it.
+    let response = lease(&backend, 1, "daemon-a");
+
+    assert_eq!(response.leased.len(), 1);
+    assert_eq!(response.leased[0].entry.entry_id, other);
+    assert_eq!(response.leased[0].execution.workflow_id, "wf-daemon-a-1");
+    assert_eq!(response.blocked.len(), 1);
+    assert_eq!(response.blocked[0].entry_id, damaged);
+}
+
+#[test]
 fn entry_with_a_workflow_id_keeps_it_and_leaves_the_new_ids_unused() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = backend(&temp);
