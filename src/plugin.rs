@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use animus_plugin_protocol::{
-    error_codes as plugin_error_codes, HealthCheckResult, HealthStatus, InitializeParams,
-    InitializeResult, KindCapability, PluginCapabilities, PluginInfo, PluginManifest, RpcError,
-    RpcRequest, RpcResponse, PLUGIN_KIND_QUEUE, PROTOCOL_VERSION,
+    error_codes as plugin_error_codes, EnvRequirement, HealthCheckResult, HealthStatus,
+    InitializeParams, InitializeResult, KindCapability, PluginCapabilities, PluginInfo,
+    PluginManifest, RpcError, RpcRequest, RpcResponse, PLUGIN_KIND_QUEUE, PROTOCOL_VERSION,
 };
 use animus_queue_protocol::{
     error_codes as queue_error_codes, QueueCapabilities, QueueCompletionRequest, QueueDropRequest,
@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::host_guard::check_host_protocol;
+use crate::lease_ttl::{lease_ttl_from_env, LEASE_TTL_ENV};
 use crate::queue_service::{
     QueueBackend, QueueCallError, QueueLeaseError, QueueReleasePendingError,
 };
@@ -144,7 +145,14 @@ fn print_manifest() {
         description: PLUGIN_DESCRIPTION.to_string(),
         protocol_version: PROTOCOL_VERSION.to_string(),
         capabilities: queue_methods().into_iter().map(|m| m.to_string()).collect(),
-        env_required: Vec::new(),
+        env_required: vec![EnvRequirement {
+            name: LEASE_TTL_ENV.to_string(),
+            description: Some(
+                "Queue lease (ticket) length in seconds, 1-604800. Default 1800.".to_string(),
+            ),
+            sensitive: false,
+            required: false,
+        }],
         notification_buffer_size: None,
         plugin_kinds: Vec::new(),
         supports_mcp: None,
@@ -277,7 +285,8 @@ async fn handle_initialize(
         Err(error) => return RpcResponse::err(id, error),
     };
 
-    *backend.write().await = Some(QueueBackend::new(project_root));
+    *backend.write().await =
+        Some(QueueBackend::new(project_root).with_lease_ttl(lease_ttl_from_env()));
 
     let capabilities = QueueCapabilities {
         priority_weighted: false,
