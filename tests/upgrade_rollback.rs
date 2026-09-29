@@ -1,5 +1,5 @@
 //! Moving between queue v0.3.3 and v0.4.0 on the same `queue.json`
-//! (spec §3.3 and §6.4), using the real v0.3.3 crate.
+//! using the real v0.3.3 crate.
 
 mod common;
 

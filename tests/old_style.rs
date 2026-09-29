@@ -321,7 +321,7 @@ fn hold_release_drop_and_completion_still_work_on_ticketed_entries() {
 
     assert!(backend.hold(&waiting.entry_id).expect("hold").changed);
     assert!(backend.release(&waiting.entry_id).expect("release").changed);
-    // v0.2.9: old-style "done" is accepted for any entry (spec §7.3).
+    // v0.2.9: old-style "done" is accepted for any entry.
     assert!(
         backend
             .completion(&running.entry_id, "completed", None, None)

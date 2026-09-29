@@ -628,7 +628,7 @@ impl QueueBackend {
         entry.lease_expires_at = None;
         // A late old-style completion from the released workflow can still
         // finish the entry's next run. That is v0.2.9's behaviour and an
-        // accepted risk for old-style calls (spec §7.3); ticketed work uses
+        // accepted risk for old-style calls; ticketed work uses
         // queue/v2/*, which is fenced.
         entry.audit_log.push(DispatchQueueAuditEntry {
             at: now,

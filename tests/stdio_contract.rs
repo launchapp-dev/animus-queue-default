@@ -1,4 +1,4 @@
-//! Contract test against the 0.7 daemon's rules (spec §8.2): the real binary
+//! Contract test against the 0.7 daemon's rules: the real binary
 //! over stdio, every reply decoded with the protocol's strict types, and the
 //! checks the daemon applies copied from animus-cli:
 //!

@@ -413,7 +413,7 @@ fn difference_5_old_style_entry_gets_ticket_identity_at_first_hand_out() {
 #[test]
 fn second_copy_of_a_task_is_handed_out_with_the_next_generation() {
     // Old files and old-style adds can hold two copies of one task. v0.2.9
-    // numbers them in queue order and hands out both (spec §7.3).
+    // numbers them in queue order and hands out both.
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = backend(&temp);
     for _ in 0..2 {

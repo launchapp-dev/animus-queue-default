@@ -347,7 +347,7 @@ impl QueueBackend {
     }
 
     /// `queue/v2/lease/renew`: extend a live ticket. The expiry moves to
-    /// `now + ttl` but never earlier than it already is (spec §7.1: the 0.7
+    /// `now + ttl` but never earlier than it already is (the 0.7
     /// daemon rejects a renewal whose expiry goes backwards). The generation
     /// stays the same. An expired ticket must be taken over instead.
     pub fn renew_lease(

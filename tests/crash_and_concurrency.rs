@@ -1,5 +1,4 @@
-//! Crash safety (spec §6.2) and many queue processes on one project
-//! (spec §6.3).
+//! Crash safety and many queue processes on one project.
 
 mod common;
 

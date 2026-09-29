@@ -35,5 +35,5 @@ semver = "1"
 
 [dev-dependencies]
 tempfile = "3"
-# The previous release, for the upgrade and rollback tests (spec §3.3, §6.4).
+# The previous release, for the upgrade and rollback tests.
 queue_v033 = { package = "animus-queue-default", git = "https://github.com/launchapp-dev/animus-queue-default", tag = "v0.3.3" }
