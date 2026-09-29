@@ -69,15 +69,22 @@ impl QueueBackend {
         dispatch: SubjectDispatch,
         run_at: Option<String>,
         expire_after_secs: Option<u64>,
-    ) -> Result<EnqueueOutcome> {
+    ) -> std::result::Result<EnqueueOutcome, QueueCallError> {
+        // A subjectless entry would make the whole file unreadable for queue
+        // v0.3.3 (its dispatch type requires a subject), which breaks the
+        // documented rollback path. Reject it before touching state.
+        let Some(subject_id) = dispatch.subject_key() else {
+            return Err(QueueCallError::InvalidParams(
+                "queue subject identity is missing".to_string(),
+            ));
+        };
+
         let _lock = acquire_queue_lock(&self.project_root)?;
         let mut state = load_queue_state(&self.project_root)?.unwrap_or_default();
 
         // Drop any expired deferred entries before evaluating this enqueue so
         // duplicate counts reflect the live queue.
         sweep_expired_entries(&mut state, Utc::now());
-
-        let subject_id = dispatch.subject_key();
 
         // Count live (non-Unknown) entries already targeting this subject —
         // used for the advisory warning. Enqueue is NOT idempotent in either
@@ -281,7 +288,7 @@ impl QueueBackend {
                 let key_owned = entry
                     .dispatch
                     .as_ref()
-                    .map(|d| d.subject_key())
+                    .and_then(SubjectDispatch::subject_key)
                     .unwrap_or_else(|| entry.subject_id_ref().to_string());
                 if set.contains(&key_owned) {
                     continue;
@@ -648,6 +655,17 @@ enum MutationError {
     NotPending,
 }
 
+/// Errors from calls that validate caller input before touching state.
+#[derive(Debug, thiserror::Error)]
+pub enum QueueCallError {
+    /// Bad caller input. Surfaced as JSON-RPC `-32602` invalid params.
+    #[error("{0}")]
+    InvalidParams(String),
+    /// Wrapped backend error (I/O, lock acquisition, persistence).
+    #[error(transparent)]
+    Backend(#[from] anyhow::Error),
+}
+
 /// Typed errors specific to `queue/lease`.
 #[derive(Debug, thiserror::Error)]
 pub enum QueueLeaseError {
@@ -837,6 +855,24 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_rejects_subjectless_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = QueueBackend::new(temp.path().to_path_buf());
+        let dispatch = SubjectDispatch::subjectless("standard", "manual-queue-enqueue", Utc::now());
+
+        let error = backend
+            .enqueue(dispatch, None, None)
+            .expect_err("subjectless enqueue must be rejected");
+
+        assert!(matches!(error, QueueCallError::InvalidParams(_)));
+        assert_eq!(error.to_string(), "queue subject identity is missing");
+        assert!(
+            !temp.path().join(".animus").exists(),
+            "a rejected enqueue must not create queue files"
+        );
+    }
+
+    #[test]
     fn hold_release_and_reorder_use_entry_ids() {
         let temp = tempfile::tempdir().expect("tempdir");
         let backend = QueueBackend::new(temp.path().to_path_buf());
@@ -1021,7 +1057,10 @@ mod tests {
             .expect("enqueue second");
 
         assert!(first.enqueued);
-        assert!(second.enqueued, "immediate duplicate is now enqueued, not deduped");
+        assert!(
+            second.enqueued,
+            "immediate duplicate is now enqueued, not deduped"
+        );
         assert_ne!(first.entry_id, second.entry_id);
         assert!(second.warning.is_some(), "collision surfaces a warning");
 
@@ -1050,9 +1089,16 @@ mod tests {
             .enqueue(task_dispatch("LATER", "standard"), Some(later), None)
             .expect("later");
         backend
-            .enqueue(task_dispatch("SOONER", "standard"), Some(sooner.clone()), None)
+            .enqueue(
+                task_dispatch("SOONER", "standard"),
+                Some(sooner.clone()),
+                None,
+            )
             .expect("sooner");
 
-        assert_eq!(backend.next_deadline().expect("nd").next_run_at, Some(sooner));
+        assert_eq!(
+            backend.next_deadline().expect("nd").next_run_at,
+            Some(sooner)
+        );
     }
 }
