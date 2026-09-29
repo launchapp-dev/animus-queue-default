@@ -108,7 +108,7 @@ Everything else fails with an error, including a missing or unparseable value (c
 
 When `host_info.version` is missing, the message says "an unknown version"; a missing `protocol_version` shows as "not sent".
 
-**Where it shows:** the daemon starts a fresh queue process for every call. So the message appears wherever that Animus talks to the queue: `animus queue …` commands, plugin checks and daemon logs.
+**Where it shows:** `animus queue …` commands print it. The 0.6.33 daemon starts a fresh queue process for every call; each start is refused before any other call, and it retries without writing the message to its own `daemon.log` (checked in §8.4: 9 refused starts in 30 seconds, queue file unchanged).
 
 **Correction (2026-09-29).** The first version of this rule went by `protocol_version` alone, refusing anything below `1.1.0`, on the belief that 0.6.x announces `1.0.0`. That value is only the generic handshake's. The §8.4 check showed the installed 0.6.33 was not refused: its queue calls announce `1.1.0`. `host_info.version` is the only field that tells the two lines apart on the path the queue actually serves.
 
