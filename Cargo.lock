@@ -33,6 +33,16 @@ dependencies = [
 
 [[package]]
 name = "animus-plugin-protocol"
+version = "0.1.14"
+source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.10#a3b39dcbe02e8c3701f85b89aca55ae010193620"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "animus-plugin-protocol"
 version = "0.1.18"
 source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.7.0-rc.43#88ee00a922b80fb785424b1f2d3231cb09a57ca7"
 dependencies = [
@@ -43,12 +53,33 @@ dependencies = [
 
 [[package]]
 name = "animus-queue-default"
+version = "0.3.3"
+source = "git+https://github.com/launchapp-dev/animus-queue-default?tag=v0.3.3#bf1331ebaaacc26bec6e28743fc2c87d679c7457"
+dependencies = [
+ "animus-plugin-protocol 0.1.14",
+ "animus-queue-protocol 0.3.2",
+ "animus-subject-protocol 0.1.15",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "fs2",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "animus-queue-default"
 version = "0.4.0"
 dependencies = [
  "animus-execution-protocol",
- "animus-plugin-protocol",
- "animus-queue-protocol",
- "animus-subject-protocol",
+ "animus-plugin-protocol 0.1.18",
+ "animus-queue-default 0.3.3",
+ "animus-queue-protocol 0.4.0",
+ "animus-subject-protocol 0.2.0",
  "anyhow",
  "async-trait",
  "chrono",
@@ -66,15 +97,43 @@ dependencies = [
 
 [[package]]
 name = "animus-queue-protocol"
+version = "0.3.2"
+source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.10#a3b39dcbe02e8c3701f85b89aca55ae010193620"
+dependencies = [
+ "animus-plugin-protocol 0.1.14",
+ "animus-subject-protocol 0.1.15",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "animus-queue-protocol"
 version = "0.4.0"
 source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.7.0-rc.43#88ee00a922b80fb785424b1f2d3231cb09a57ca7"
 dependencies = [
  "animus-execution-protocol",
- "animus-plugin-protocol",
- "animus-subject-protocol",
+ "animus-plugin-protocol 0.1.18",
+ "animus-subject-protocol 0.2.0",
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "animus-subject-protocol"
+version = "0.1.15"
+source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.5.10#a3b39dcbe02e8c3701f85b89aca55ae010193620"
+dependencies = [
+ "animus-plugin-protocol 0.1.14",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -83,7 +142,7 @@ version = "0.2.0"
 source = "git+https://github.com/launchapp-dev/animus-protocol?tag=v0.7.0-rc.43#88ee00a922b80fb785424b1f2d3231cb09a57ca7"
 dependencies = [
  "animus-actor",
- "animus-plugin-protocol",
+ "animus-plugin-protocol 0.1.18",
  "anyhow",
  "async-trait",
  "chrono",
