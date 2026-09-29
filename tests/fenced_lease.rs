@@ -488,6 +488,38 @@ fn entry_without_a_usable_subject_is_blocked_and_the_rest_still_run() {
 }
 
 #[test]
+fn damaged_ticket_identity_is_blocked_instead_of_crashing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    let damaged = add(&backend, "TASK-1");
+    let other = add(&backend, "TASK-2");
+    // A hand-edited or corrupt queue.json: generations must be at least 1.
+    edit_state(temp.path(), |state| {
+        let entry = common::entry_mut(state, &damaged);
+        entry.subject_generation = Some(0);
+        entry.workflow_generation = Some(0);
+    });
+    let before = read_entry(temp.path(), &damaged);
+
+    let response = lease(&backend, 5, "daemon-a");
+
+    assert_eq!(response.leased.len(), 1);
+    assert_eq!(response.leased[0].entry.entry_id, other);
+    assert_eq!(response.blocked.len(), 1);
+    assert_eq!(response.blocked[0].entry_id, damaged);
+    assert_eq!(
+        response.blocked[0].reason,
+        QueueLeaseBlockReason::MissingExecutionIdentity
+    );
+    // The damaged entry is left exactly as it was: still waiting, no owner.
+    let after = read_entry(temp.path(), &damaged);
+    assert_eq!(after.status, DispatchQueueEntryStatus::Pending);
+    assert_eq!(after.lease_owner, before.lease_owner);
+    assert_eq!(after.lease_generation, before.lease_generation);
+    assert_eq!(after.workflow_id, before.workflow_id);
+}
+
+#[test]
 fn entry_with_a_workflow_id_keeps_it_and_leaves_the_new_ids_unused() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = backend(&temp);

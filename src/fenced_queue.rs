@@ -301,6 +301,7 @@ impl QueueBackend {
             else {
                 break;
             };
+            let before = state.entries[index].clone();
             let entry = &mut state.entries[index];
             entry.status = DispatchQueueEntryStatus::Assigned;
             entry.workflow_id = Some(workflow_id);
@@ -310,12 +311,26 @@ impl QueueBackend {
             entry.lease_expires_at = Some(expires_at);
             entry.assigned_at = Some(now.to_rfc3339());
             entry.held_at = None;
+            // A generation of 0 or an empty id can only come from a damaged
+            // queue.json. Leave that entry as it was and report it, rather
+            // than failing the whole call on every hand-out.
+            let Some(execution) = entry.execution_fence() else {
+                tracing::warn!(
+                    entry_id = %entry_id,
+                    "queue/v2/lease: entry has damaged ticket identity; left unchanged"
+                );
+                state.entries[index] = before;
+                blocked.push(lease_block(
+                    entry_id,
+                    QueueLeaseBlockReason::MissingExecutionIdentity,
+                    None,
+                ));
+                continue;
+            };
             changed = true;
             leased.push(FencedQueueEntry {
                 entry: entry_to_protocol(entry).expect("checked above: entry has a dispatch"),
-                execution: entry
-                    .execution_fence()
-                    .expect("a just-leased entry has complete ticket identity"),
+                execution,
             });
         }
 
@@ -528,7 +543,8 @@ impl QueueBackend {
 
     /// The outcome for an entry that is no longer live. v0.2.9 keeps
     /// finished rows and answers from them; this queue answers from the
-    /// history, taking the first record for the entry.
+    /// history, taking the last record for the entry (the one that took
+    /// effect).
     fn finished_entry_outcome(
         &self,
         entry_id: &str,
