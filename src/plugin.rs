@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::host_guard::check_host_protocol;
 use crate::queue_service::{
     QueueBackend, QueueCallError, QueueLeaseError, QueueReleasePendingError,
 };
@@ -252,14 +253,23 @@ async fn handle_initialize(
     params: Option<Value>,
     backend: &Arc<RwLock<Option<QueueBackend>>>,
 ) -> RpcResponse {
-    let init: InitializeParams = match params
-        .ok_or_else(|| invalid_params("missing params for initialize"))
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| invalid_params(format!("invalid initialize params: {error}")))
-        }) {
+    let Some(params) = params else {
+        return RpcResponse::err(id, invalid_params("missing params for initialize"));
+    };
+    // Refuse 0.6.x and older hosts first, before the project binding is even
+    // read, so a refused host never reaches the queue files.
+    let host_protocol = params.get("protocol_version").and_then(Value::as_str);
+    if let Err(error) = check_host_protocol(host_protocol) {
+        return RpcResponse::err(id, error);
+    }
+    let init: InitializeParams = match serde_json::from_value(params) {
         Ok(value) => value,
-        Err(error) => return RpcResponse::err(id, error),
+        Err(error) => {
+            return RpcResponse::err(
+                id,
+                invalid_params(format!("invalid initialize params: {error}")),
+            );
+        }
     };
 
     let project_root = match extract_project_root(&init) {
