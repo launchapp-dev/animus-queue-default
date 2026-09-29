@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::fenced_queue::MAX_LEASE_BATCH;
-use crate::host_guard::check_host_protocol;
+use crate::host_guard::check_host;
 use crate::lease_ttl::{lease_ttl_from_env, LEASE_TTL_ENV};
 use crate::queue_service::{
     QueueBackend, QueueCallError, QueueLeaseError, QueueMutationError, QueueReleasePendingError,
@@ -339,7 +339,11 @@ async fn handle_initialize(
     // Refuse 0.6.x and older hosts first, before the project binding is even
     // read, so a refused host never reaches the queue files.
     let host_protocol = params.get("protocol_version").and_then(Value::as_str);
-    if let Err(error) = check_host_protocol(host_protocol) {
+    let host_version = params
+        .get("host_info")
+        .and_then(|host_info| host_info.get("version"))
+        .and_then(Value::as_str);
+    if let Err(error) = check_host(host_protocol, host_version) {
         return RpcResponse::err(id, error);
     }
     let init: InitializeParams = match serde_json::from_value(params) {

@@ -1,4 +1,5 @@
-//! The old-CLI guard, exercised through the real binary.
+//! The old-CLI guard, exercised through the real binary. The `initialize`
+//! params are the ones captured from the real CLIs.
 
 mod common;
 
@@ -9,19 +10,20 @@ const INVALID_PARAMS: i64 = -32602;
 const PLUGIN_NOT_INITIALIZED: i64 = -32000;
 
 #[test]
-fn protocol_1_0_host_is_refused_before_any_file_access() {
+fn animus_0_6_is_refused_before_any_file_access() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut plugin = PluginProcess::spawn(&[]);
 
-    let refused = plugin.initialize(temp.path(), "1.0.0");
+    // Animus 0.6.33's queue calls announce protocol 1.1.0, like 0.7's do.
+    let refused = plugin.initialize_as(temp.path(), "1.1.0", "0.6.33");
     assert_eq!(refused["error"]["code"], INVALID_PARAMS);
     let message = refused["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("requires Animus 0.7 or newer"),
+        message.contains("requires Animus 0.7 or newer. This Animus is 0.6.33"),
         "{message}"
     );
     assert!(
-        message.contains("animus plugin install launchapp-dev/animus-queue-default@v0.3.3"),
+        message.contains("animus plugin install launchapp-dev/animus-queue-default@v0.3.3 --force"),
         "{message}"
     );
 
@@ -35,6 +37,37 @@ fn protocol_1_0_host_is_refused_before_any_file_access() {
 }
 
 #[test]
+fn animus_0_6_generic_handshake_is_refused() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut plugin = PluginProcess::spawn(&[]);
+    let refused = plugin.initialize_as(temp.path(), "1.0.0", "0.1.0");
+    assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+}
+
+#[test]
+fn missing_host_version_is_refused() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut plugin = PluginProcess::spawn(&[]);
+
+    let refused = plugin.request(
+        "initialize",
+        json!({
+            "protocol_version": "1.1.0",
+            "capabilities": {},
+            "init_extensions": {
+                "project_binding": { "project_root": temp.path().to_string_lossy() }
+            }
+        }),
+    );
+
+    assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+    assert!(refused["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("This Animus is an unknown version (plugin protocol 1.1.0)"));
+}
+
+#[test]
 fn missing_protocol_version_is_refused() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut plugin = PluginProcess::spawn(&[]);
@@ -42,7 +75,7 @@ fn missing_protocol_version_is_refused() {
     let refused = plugin.request(
         "initialize",
         json!({
-            "host_info": { "name": "animus", "version": "0.1.0" },
+            "host_info": { "name": "animus", "version": "0.7.0-rc.52" },
             "capabilities": {},
             "init_extensions": {
                 "project_binding": { "project_root": temp.path().to_string_lossy() }
@@ -58,12 +91,17 @@ fn missing_protocol_version_is_refused() {
 }
 
 #[test]
-fn protocol_1_1_and_1_2_hosts_are_accepted() {
-    for version in ["1.1.0", "1.2.0"] {
+fn animus_0_7_is_accepted() {
+    // 0.7's queue calls (1.1.0 + its CLI version) and its generic
+    // plugin-host handshake (1.2.0 + the host crate's 0.1.0).
+    for (protocol, host) in [("1.1.0", "0.7.0-rc.52"), ("1.2.0", "0.1.0")] {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plugin = PluginProcess::spawn(&[]);
-        let accepted = plugin.initialize(temp.path(), version);
-        assert!(accepted.get("error").is_none(), "{version}: {accepted}");
+        let accepted = plugin.initialize_as(temp.path(), protocol, host);
+        assert!(
+            accepted.get("error").is_none(),
+            "{protocol}/{host}: {accepted}"
+        );
         assert_eq!(accepted["result"]["protocol_version"], "1.2.0");
     }
 }

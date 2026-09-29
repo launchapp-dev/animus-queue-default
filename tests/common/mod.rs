@@ -131,13 +131,25 @@ impl PluginProcess {
         response
     }
 
-    /// `initialize` bound to `project_root`, announcing `protocol_version`.
+    /// `initialize` bound to `project_root`, announcing `protocol_version`
+    /// as Animus 0.7.0-rc.52 (what that CLI sends on its queue calls).
     pub fn initialize(&mut self, project_root: &Path, protocol_version: &str) -> Value {
+        self.initialize_as(project_root, protocol_version, "0.7.0-rc.52")
+    }
+
+    /// `initialize` bound to `project_root`, announcing `protocol_version`
+    /// and `host_version` as `host_info.version`.
+    pub fn initialize_as(
+        &mut self,
+        project_root: &Path,
+        protocol_version: &str,
+        host_version: &str,
+    ) -> Value {
         self.request(
             "initialize",
             json!({
                 "protocol_version": protocol_version,
-                "host_info": { "name": "animus", "version": "0.1.0" },
+                "host_info": { "name": "animus", "version": host_version },
                 "capabilities": {},
                 "init_extensions": {
                     "project_binding": { "project_root": project_root.to_string_lossy() }
