@@ -106,7 +106,7 @@ Everything else fails with an error, including a missing or unparseable value (c
 
 > animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6.33 (plugin protocol 1.1.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3 --force`
 
-When `host_info.version` is missing, the message says "an unknown version"; a missing `protocol_version` shows as "not sent".
+When `host_info.version` is missing, the message says "an unknown version". When the protocol is below `1.1.0` (0.6's generic handshake, whose `host_info.version` is the plugin-host crate's `0.1.0`), it says "0.6 or older". A missing `protocol_version` shows as "not sent".
 
 **Where it shows:** `animus queue …` commands print it. The 0.6.33 daemon starts a fresh queue process for every call; each start is refused before any other call, and it retries without writing the message to its own `daemon.log` (checked in §8.4: 9 refused starts in 30 seconds, queue file unchanged).
 
