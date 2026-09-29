@@ -15,9 +15,13 @@ A 0.6.x CLI already installs v0.3.3 through its built-in pin (`animus plugin ins
 
 ### Old CLIs are refused
 
-This queue refuses any host that announces plugin protocol below `1.1.0` at `initialize`, which covers every 0.6.x CLI. The refusal happens before the queue files are opened, so they are left untouched. The error says what to do:
+At `initialize`, this queue checks the Animus version the host sends (`host_info.version`) and refuses anything older than 0.7.0. Release candidates such as `0.7.0-rc.52` count as 0.7. The plugin protocol version can't be used for this: every CLI since v0.5.0 announces `1.1.0` on its queue calls, 0.6.x included. One exception is accepted whatever version it sends: plugin protocol `1.2.0` or newer, which only 0.7's generic plugin handshake announces. A missing or unreadable version is refused.
 
-> animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6 or older (plugin protocol 1.0.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3`
+The refusal happens before the queue files are opened, so they are left untouched. The error says what to do:
+
+> animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6.33 (plugin protocol 1.1.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3 --force`
+
+`--force` is needed because a queue plugin is already installed.
 
 `--manifest` still works for any caller.
 

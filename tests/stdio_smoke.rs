@@ -64,7 +64,7 @@ fn stdio_initialize_then_enqueue_and_lease() {
         "method": "initialize",
         "params": {
             "protocol_version": "1.1.0",
-            "host_info": { "name": "animus", "version": "0.5.0" },
+            "host_info": { "name": "animus", "version": "0.7.0-rc.52" },
             "capabilities": {},
             "init_extensions": {
                 "project_binding": {
@@ -160,7 +160,7 @@ fn stdio_accepts_pretty_printed_multi_line_frame() {
         "method": "initialize",
         "params": {
             "protocol_version": "1.1.0",
-            "host_info": { "name": "animus", "version": "0.5.0" },
+            "host_info": { "name": "animus", "version": "0.7.0-rc.52" },
             "capabilities": {},
             "init_extensions": {
                 "project_binding": {

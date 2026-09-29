@@ -81,28 +81,36 @@ Tickets last 30 minutes. The holder renews its ticket while it works. After the 
 
 ### 3.2 The guard
 
-**How the queue tells hosts apart.** At `initialize`, the queue reads the host's `protocol_version`:
+**How the queue tells hosts apart.** At `initialize`, the queue reads two fields the host sends: `protocol_version` and `host_info.version`. Animus sends them from two places (captured on the wire from the installed 0.6.33 and a 0.7.0-rc.52 build in the §8.4 checks):
 
-| CLI releases | `protocol_version` sent |
-|---|---|
-| v0.4.0 – v0.6.33 | `1.0.0` |
-| First 0.7 pre-releases (rc.1 – rc.8) | `1.1.0` |
-| rc.9 – rc.52 | `1.2.0` |
+| Sender | `protocol_version` | `host_info.version` |
+|---|---|---|
+| Queue calls from 0.6.33 (CLI and daemon, `plugin_clients.rs`) | `1.1.0` | `0.6.33` |
+| Queue calls from 0.7.0-rc.52 | `1.1.0` | `0.7.0-rc.52` |
+| Generic plugin-host handshake, 0.6.33 | `1.0.0` | `0.1.0` |
+| Generic plugin-host handshake, 0.7.0-rc.52 | `1.2.0` | `0.1.0` |
 
-Each tag was checked individually.
+`plugin_clients.rs` hard-codes `1.1.0` in every tag from v0.5.0 to v0.6.33 and in rc.52, and fills `host_info.version` with the CLI's own version. The generic handshake sends the plugin-host crate's version, `0.1.0`, and no project binding, so the queue rejects it at binding anyway (`-32207`).
 
-**Rule:** if the host's `protocol_version` is missing, unparseable, or below `1.1.0` (compared as semantic versions), `initialize` fails with an error.
+**Rule:** `initialize` is accepted when either:
+
+- `protocol_version` is at least `1.2.0`, or
+- `protocol_version` is at least `1.1.0` and `host_info.version` is at least `0.7.0-0`, so every 0.7.0 release candidate counts as 0.7.
+
+Everything else fails with an error, including a missing or unparseable value (compared as semantic versions).
 
 - The refusal happens before any file access, so a refused host never reads or changes the queue files.
 - `--manifest` still works, because printing the manifest doesn't go through `initialize`.
 
-**Message.** The final recovery command is confirmed in testing (§8.4):
+**Message.** The recovery command was confirmed with the installed 0.6.33 (§8.4); `--force` is needed because a queue plugin is already installed:
 
-> animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6 or older (plugin protocol 1.0.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3`
+> animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6.33 (plugin protocol 1.1.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3 --force`
+
+When `host_info.version` is missing, the message says "an unknown version"; a missing `protocol_version` shows as "not sent".
 
 **Where it shows:** the daemon starts a fresh queue process for every call. So the message appears wherever that Animus talks to the queue: `animus queue …` commands, plugin checks and daemon logs.
 
-**Why not use the host's version string:** `host_info.version` is the plugin-host crate's own version, `0.1.0`, in both 0.6.33 and 0.7. It can't tell them apart.
+**Correction (2026-09-29).** The first version of this rule went by `protocol_version` alone, refusing anything below `1.1.0`, on the belief that 0.6.x announces `1.0.0`. That value is only the generic handshake's. The §8.4 check showed the installed 0.6.33 was not refused: its queue calls announce `1.1.0`. `host_info.version` is the only field that tells the two lines apart on the path the queue actually serves.
 
 ### 3.3 Going back from 0.7 to 0.6.x
 
@@ -385,8 +393,8 @@ These were each considered and kept as v0.2.9 does them:
    - A resent ticketed add whose original entry expired in the same call still returns the original receipt, and a different add with that key is still refused.
    - Many queue processes working on one project at once: no task is ever handed out twice.
    - The guard:
-     - `initialize` with protocol `1.0.0`, a missing version or an unparseable one is refused, and the queue files aren't touched.
-     - `1.1.0`, `1.2.0` and later `1.x` versions are accepted.
+     - `initialize` from 0.6.33 (protocol `1.1.0`, host `0.6.33`), from 0.6's generic handshake (`1.0.0`, `0.1.0`), or with a missing or unparseable protocol or host version is refused, and the queue files aren't touched.
+     - 0.7 queue calls (`1.1.0`, `0.7.0-rc.52`) and 0.7's generic handshake (`1.2.0`, `0.1.0`) are accepted.
 2. **Contract test against the daemon's rules:**
    - Run the real binary and do the handshake.
    - Check every reply with the protocol's strict types (`deny_unknown_fields`).

@@ -23,7 +23,7 @@
 
 - **Version:** crate version `0.4.0`.
 - **Protocol:** `animus-plugin-protocol`, `animus-queue-protocol`, `animus-subject-protocol` and `animus-execution-protocol` from `https://github.com/launchapp-dev/animus-protocol` at tag `v0.7.0-rc.43`.
-- **Host guard:**
+- **Host guard:** *(Superseded after Task 14's old-version check: the installed 0.6.33 announces protocol `1.1.0` on its queue calls, so the rule below refused nothing. The guard now also reads `host_info.version`, and the message names that version and ends in `--force`. Spec §3.2 is authoritative; the task code below is the original version.)*
   - Refuse `initialize` when the host's `protocol_version` is missing, unparseable, or below `1.1.0` (semver comparison, so pre-releases of 1.1.0 are below).
   - Refuse before any file access.
   - The message is exactly: animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6 or older (plugin protocol 1.0.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3` (the version in parentheses is whatever the host sent, or "not sent").
