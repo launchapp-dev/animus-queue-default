@@ -7,9 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use animus_queue_protocol::{
-    completion_status, status, QueueEntry, QueueLeaseResponse, QueueListResponse,
-    QueueMutationResponse, QueueNextDeadlineResponse, QueueReleasePendingResponse,
-    QueueReorderResponse, QueueStats,
+    status, QueueEntry, QueueLeaseResponse, QueueListResponse, QueueMutationResponse,
+    QueueNextDeadlineResponse, QueueReleasePendingResponse, QueueReorderResponse, QueueStats,
 };
 use animus_subject_protocol::SubjectDispatch;
 use anyhow::Result;
@@ -20,6 +19,7 @@ use crate::dispatch_queue_state::{
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state, save_queue_state};
 use crate::lease_ttl::DEFAULT_LEASE_TTL_SECS;
+use crate::queue_history::{append_history, HistoryOutcome, HistoryRecord};
 
 /// File-locked backend wrapping a single project root's queue state.
 #[derive(Debug, Clone)]
@@ -101,7 +101,7 @@ impl QueueBackend {
 
         // Drop any expired deferred entries before evaluating this enqueue so
         // duplicate counts reflect the live queue.
-        sweep_expired_entries(&mut state, Utc::now());
+        let finished = sweep_expired_entries(&mut state, Utc::now());
 
         // Count live (non-Unknown) entries already targeting this subject —
         // used for the advisory warning. Enqueue is NOT idempotent in either
@@ -129,7 +129,7 @@ impl QueueBackend {
         let entry = DispatchQueueEntry::from_dispatch(dispatch, run_at, expire_after_secs);
         let entry_id = entry.entry_id.clone();
         state.entries.push(entry);
-        save_queue_state(&self.project_root, &state)?;
+        self.commit(&state, &finished)?;
         Ok(EnqueueOutcome {
             enqueued: true,
             entry_id,
@@ -208,7 +208,7 @@ impl QueueBackend {
         let _lock = acquire_queue_lock(&self.project_root)?;
         let mut state = load_queue_state(&self.project_root)?.unwrap_or_default();
         let now = Utc::now();
-        let swept = sweep_expired_entries(&mut state, now);
+        let finished = sweep_expired_entries(&mut state, now);
         let next_run_at = state
             .entries
             .iter()
@@ -217,8 +217,8 @@ impl QueueBackend {
             .filter(|run_at| *run_at > now)
             .min()
             .map(|run_at| run_at.to_rfc3339());
-        if swept > 0 {
-            save_queue_state(&self.project_root, &state)?;
+        if !finished.is_empty() {
+            self.commit(&state, &finished)?;
         }
         Ok(QueueNextDeadlineResponse { next_run_at })
     }
@@ -268,7 +268,7 @@ impl QueueBackend {
         let now = Utc::now();
         // Drop deferred entries that blew past their expiry window while the
         // daemon was unavailable, instead of dispatching them late.
-        let swept = sweep_expired_entries(&mut state, now);
+        let finished = sweep_expired_entries(&mut state, now);
         let now_rfc3339 = now.to_rfc3339();
         let mut leased: Vec<QueueEntry> = Vec::new();
         let mut assigned_index = 0usize;
@@ -330,8 +330,9 @@ impl QueueBackend {
             }
         }
 
-        if !leased.is_empty() || swept > 0 {
-            save_queue_state(&self.project_root, &state).map_err(QueueLeaseError::Backend)?;
+        if !leased.is_empty() || !finished.is_empty() {
+            self.commit(&state, &finished)
+                .map_err(QueueLeaseError::Backend)?;
         }
         Ok(QueueLeaseResponse { leased })
     }
@@ -380,16 +381,19 @@ impl QueueBackend {
                 not_found: true,
             });
         };
-        let before = state.entries.len();
-        state.entries.retain(|entry| entry.entry_id != entry_id);
-        let removed = before.saturating_sub(state.entries.len());
-        if removed == 0 {
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == entry_id)
+        else {
             return Ok(QueueMutationResponse {
                 changed: false,
                 not_found: true,
             });
-        }
-        save_queue_state(&self.project_root, &state)?;
+        };
+        let dropped = state.entries.remove(index);
+        let record = HistoryRecord::finished(&dropped, HistoryOutcome::Dropped, "queue/drop", None);
+        self.commit(&state, &[record])?;
         Ok(QueueMutationResponse {
             changed: true,
             not_found: false,
@@ -492,14 +496,11 @@ impl QueueBackend {
         workflow_ref: Option<&str>,
         workflow_id: Option<&str>,
     ) -> Result<QueueMutationResponse> {
-        if !matches!(
-            status,
-            completion_status::COMPLETED | completion_status::FAILED | completion_status::CANCELLED
-        ) {
+        let Some(outcome) = HistoryOutcome::from_completion_status(status) else {
             return Err(anyhow::anyhow!(
                 "invalid completion status: '{status}' (expected one of: completed, failed, cancelled)"
             ));
-        }
+        };
 
         let _lock = acquire_queue_lock(&self.project_root)?;
         let Some(mut state) = load_queue_state(&self.project_root)? else {
@@ -508,46 +509,34 @@ impl QueueBackend {
                 not_found: true,
             });
         };
-        let before = state.entries.len();
-        state.entries.retain(|entry| {
-            if entry.entry_id != entry_id {
-                return true;
-            }
-            // Completion only prunes Assigned entries — a stale or misrouted
-            // completion frame for a Pending/Held entry must NOT delete queued
-            // work that was never leased.
-            if entry.status != DispatchQueueEntryStatus::Assigned {
-                return true;
-            }
-            // Match workflow_ref / workflow_id when provided.
-            if let Some(workflow_ref) = workflow_ref {
-                if entry
-                    .dispatch
-                    .as_ref()
-                    .is_some_and(|dispatch| dispatch.workflow_ref != workflow_ref)
-                {
-                    return true;
-                }
-            }
-            if let Some(workflow_id) = workflow_id {
-                if entry
-                    .workflow_id
-                    .as_deref()
-                    .is_some_and(|existing| existing != workflow_id)
-                {
-                    return true;
-                }
-            }
-            false
-        });
-        let removed = before.saturating_sub(state.entries.len());
-        if removed == 0 {
+        let Some(index) = state.entries.iter().position(|entry| {
+            entry.entry_id == entry_id
+                // Completion only finishes Assigned entries — a stale or
+                // misrouted completion frame for a Pending/Held entry must NOT
+                // delete queued work that was never leased.
+                && entry.status == DispatchQueueEntryStatus::Assigned
+                // Match workflow_ref / workflow_id when provided.
+                && workflow_ref.is_none_or(|workflow_ref| {
+                    entry
+                        .dispatch
+                        .as_ref()
+                        .is_none_or(|dispatch| dispatch.workflow_ref == workflow_ref)
+                })
+                && workflow_id.is_none_or(|workflow_id| {
+                    entry
+                        .workflow_id
+                        .as_deref()
+                        .is_none_or(|existing| existing == workflow_id)
+                })
+        }) else {
             return Ok(QueueMutationResponse {
                 changed: false,
                 not_found: true,
             });
-        }
-        save_queue_state(&self.project_root, &state)?;
+        };
+        let done = state.entries.remove(index);
+        let record = HistoryRecord::finished(&done, outcome, "queue/completion", None);
+        self.commit(&state, &[record])?;
         Ok(QueueMutationResponse {
             changed: true,
             not_found: false,
@@ -622,6 +611,17 @@ impl QueueBackend {
     // ============================================================
     // Internal helpers
     // ============================================================
+
+    /// Persist `state`, first recording `finished` entries in the history
+    /// (see [`crate::queue_history`] for why this order is crash-safe).
+    pub(crate) fn commit(
+        &self,
+        state: &DispatchQueueState,
+        finished: &[HistoryRecord],
+    ) -> Result<()> {
+        append_history(&self.project_root, finished)?;
+        save_queue_state(&self.project_root, state)
+    }
 
     fn mutate_entry<F>(&self, entry_id: &str, mutate: F) -> Result<QueueMutationResponse>
     where
@@ -770,12 +770,13 @@ fn entry_to_protocol(entry: &DispatchQueueEntry) -> Option<QueueEntry> {
 /// Remove Pending deferred entries whose expiry window has elapsed (`now`
 /// is past `run_at + expire_after_secs`). Only Pending entries are swept —
 /// an entry already Assigned/Held is in flight and out of scope. Returns
-/// the number of entries dropped so callers know whether to persist.
-fn sweep_expired_entries(
+/// history records for the dropped entries; callers persist them with
+/// [`QueueBackend::commit`].
+pub(crate) fn sweep_expired_entries(
     state: &mut DispatchQueueState,
     now: chrono::DateTime<chrono::Utc>,
-) -> usize {
-    let before = state.entries.len();
+) -> Vec<HistoryRecord> {
+    let mut finished = Vec::new();
     state.entries.retain(|entry| {
         if entry.status != DispatchQueueEntryStatus::Pending {
             return true;
@@ -787,12 +788,18 @@ fn sweep_expired_entries(
                     subject_id = entry.subject_id_ref(),
                     "queue: expiring deferred entry past its run_at + expire_after_secs window"
                 );
+                finished.push(HistoryRecord::finished(
+                    entry,
+                    HistoryOutcome::Dropped,
+                    "expiry-sweep",
+                    Some("run_at + expire_after_secs passed before the entry was leased"),
+                ));
                 false
             }
             _ => true,
         }
     });
-    before - state.entries.len()
+    finished
 }
 
 fn stats_from_state(state: &DispatchQueueState) -> QueueStats {
