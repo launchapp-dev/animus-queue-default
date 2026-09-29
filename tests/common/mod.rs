@@ -1,0 +1,76 @@
+//! Helpers shared by the integration tests. Each test file uses a subset.
+#![allow(dead_code)]
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use serde_json::{json, Value};
+
+/// A running plugin process driven over stdio, one request at a time.
+pub struct PluginProcess {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl PluginProcess {
+    /// Spawn the compiled plugin binary with extra environment variables.
+    pub fn spawn(envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_animus-queue-default"));
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn plugin");
+        let stdin = child.stdin.take().expect("stdin");
+        let reader = BufReader::new(child.stdout.take().expect("stdout"));
+        Self {
+            child,
+            stdin,
+            reader,
+            next_id: 1,
+        }
+    }
+
+    /// Send one request and return its full response frame.
+    pub fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(self.stdin, "{frame}").expect("write frame");
+        self.stdin.flush().expect("flush frame");
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read frame");
+        let response: Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|error| panic!("invalid JSON frame: {error}; raw: {line}"));
+        assert_eq!(response["id"], id, "response id");
+        response
+    }
+
+    /// `initialize` bound to `project_root`, announcing `protocol_version`.
+    pub fn initialize(&mut self, project_root: &Path, protocol_version: &str) -> Value {
+        self.request(
+            "initialize",
+            json!({
+                "protocol_version": protocol_version,
+                "host_info": { "name": "animus", "version": "0.1.0" },
+                "capabilities": {},
+                "init_extensions": {
+                    "project_binding": { "project_root": project_root.to_string_lossy() }
+                }
+            }),
+        )
+    }
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

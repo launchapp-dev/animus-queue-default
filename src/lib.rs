@@ -20,6 +20,7 @@
 
 pub mod dispatch_queue_state;
 pub mod dispatch_queue_store;
+pub mod host_guard;
 pub mod identity;
 pub mod plugin;
 pub mod queue_service;
