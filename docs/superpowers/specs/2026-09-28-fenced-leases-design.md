@@ -411,7 +411,6 @@ These were each considered and kept as v0.2.9 does them:
    - **Rollback:** v0.3.3 lists a queue file written by v0.4.0, with waiting and held tasks intact.
 5. **Quality gates:**
    - `cargo fmt`, `clippy` and the repo's CI.
-   - `codex review` before each commit.
 6. **After release (on the owner's go):**
    - All four platforms' binaries and signatures are present.
    - `animus plugin install launchapp-dev/animus-queue-default@v0.4.0` works.

@@ -52,7 +52,6 @@
 - **Tests:** tests use `tempfile` directories only. The manual end-to-end task uses an isolated `HOME`. Never read or write the real `~/.animus`.
 - **Gates** before every commit:
   - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --all-features` (plus `cargo build --release` in Task 14).
-  - Then `codex review --uncommitted` until it reports no `[P1]`.
 - **Attribution:**
   - Never add Claude as a co-author and never include a Claude session link or ID in anything shipped.
   - That means no `Co-Authored-By: Claude …` trailer, no `Claude-Session: …` trailer, no `https://claude.ai/code/session_…` link, and no "Generated with Claude Code" line.
@@ -408,7 +407,7 @@ Run: `cargo test --all-features`
 
 Expected: all tests pass, including `queue_service::tests::enqueue_rejects_subjectless_dispatch`.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -419,16 +418,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -868,7 +857,7 @@ Run: `cargo test --lib -- identity request_hash`
 
 Expected: all `identity::tests::*` and `request_hash::tests::*` pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -879,16 +868,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -1282,7 +1261,7 @@ Run: `cargo test --test host_guard && cargo test --lib host_guard`
 
 Expected: all pass. The refusal message is exactly: animus-queue-default v0.4.0 requires Animus 0.7 or newer. This Animus is 0.6 or older (plugin protocol 1.0.0). Install the queue version made for it: `animus plugin install launchapp-dev/animus-queue-default@v0.3.3`
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -1293,16 +1272,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -1569,7 +1538,7 @@ Run: `cargo test --test stdio_smoke && cargo test --lib lease_ttl`
 
 Expected: all pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -1580,16 +1549,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -2327,7 +2286,7 @@ Run: `cargo test --all-features`
 
 Expected: all tests pass, including `dispatch_queue_store::tests::newer_format_is_refused` and `empty_state_is_written_and_keeps_generation_counters` and `state_dir_is_created_once_and_directories_can_be_flushed`.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -2338,16 +2297,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -3189,7 +3138,7 @@ Run: `cargo test --all-features`
 
 Expected: all pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -3200,16 +3149,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -4243,7 +4182,7 @@ Run: `cargo test --all-features`
 
 Expected: all pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -4254,16 +4193,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -5362,7 +5291,7 @@ Run: `cargo test --test fenced_enqueue`
 
 Expected: 19 tests pass. `cargo test --all-features` passes too, including two new tests in `tests/old_style.rs` and two new unit tests in `dispatch_queue_state`.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -5373,16 +5302,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -6252,7 +6171,7 @@ Run: `cargo test --test fenced_lease`
 
 Expected: 16 tests pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -6263,16 +6182,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -7266,7 +7175,7 @@ Run: `cargo test --test fenced_tickets`
 
 Expected: 21 tests pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -7277,16 +7186,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -7755,7 +7654,7 @@ Run: `cargo test --test stdio_contract`
 
 Expected: 3 tests pass (the takeover test sleeps about 3 seconds).
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -7766,16 +7665,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -8276,7 +8165,7 @@ Run: `cargo test --all-features`
 
 Expected: all pass.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -8287,16 +8176,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
@@ -8574,7 +8453,7 @@ Run: `cargo doc --no-deps`
 
 Expected: no warnings.
 
-- [ ] **Step 5: Gates and codex review**
+- [ ] **Step 5: Gates**
 
 Run the gates (spec §8.5):
 
@@ -8585,16 +8464,6 @@ cargo test --all-features
 ```
 
 Expected: no output from `fmt`, no clippy warnings, every test binary reports `ok`.
-
-Then stage and self-review with codex (repo rule):
-
-```bash
-git add -A
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null
-timeout 540 codex review --uncommitted -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null
-```
-
-Fix every `[P1]` and re-run until none remain. Fix a `[P2]` inline if it is about 10 lines; otherwise leave `// TODO(codex-p2):` and list it in your report.
 
 - [ ] **Step 6: Commit**
 
