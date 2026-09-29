@@ -1,8 +1,8 @@
 [package]
 name = "animus-queue-default"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
-description = "Reference queue plugin for Animus v0.5 (lift-and-shift of in-tree dispatch queue + atomic queue/lease + queue/release_pending)"
+description = "Reference queue plugin for Animus: file-backed dispatch queue with generation-fenced (ticketed) leases"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/launchapp-dev/animus-queue-default"
 
@@ -15,9 +15,10 @@ name = "animus_queue_default"
 path = "src/lib.rs"
 
 [dependencies]
-animus-plugin-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.10" }
-animus-queue-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.10" }
-animus-subject-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.10" }
+animus-plugin-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.43" }
+animus-queue-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.43" }
+animus-subject-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.43" }
+animus-execution-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.43" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +30,10 @@ thiserror = "1"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
+sha2 = "0.10"
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# The previous release, for the upgrade and rollback tests.
+queue_v033 = { package = "animus-queue-default", git = "https://github.com/launchapp-dev/animus-queue-default", tag = "v0.3.3" }
