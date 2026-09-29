@@ -353,3 +353,39 @@ fn ticketed_refusal_uses_the_stale_fence_error_code() {
         .unwrap()
         .contains("use queue/v2/*"));
 }
+
+#[test]
+fn oversized_expiry_on_an_old_style_add_never_expires() {
+    // The old-style add stores any expiry, as v0.2.9 does. One no timestamp
+    // can hold means "never expires"; it must not break later calls.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    for (n, secs) in [i64::MAX as u64, u64::MAX].into_iter().enumerate() {
+        backend
+            .enqueue(
+                task_dispatch(&format!("TASK-{n}"), "coding"),
+                Some("2020-01-01T00:00:00Z".to_string()),
+                Some(secs),
+            )
+            .expect("old-style add");
+    }
+    backend.next_deadline().expect("sweep");
+    assert_eq!(backend.stats().expect("stats").total, 2);
+}
+
+#[test]
+fn old_style_add_does_not_see_a_ticketed_copy() {
+    // v0.2.9 compares the old-style key (`TASK-1`) with stored ids, and
+    // ticketed entries store `task:TASK-1`, so it gives no warning here.
+    // Nothing in Animus 0.7 calls the old-style add.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backend = backend(&temp);
+    backend
+        .enqueue_v2(common::enqueue_request("TASK-1"))
+        .expect("ticketed add");
+    let added = backend
+        .enqueue(task_dispatch("TASK-1", "coding"), None, None)
+        .expect("old-style add");
+    assert!(added.enqueued);
+    assert_eq!(added.warning, None);
+}

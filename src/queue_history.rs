@@ -164,13 +164,14 @@ pub fn find_history_by_entry_id(
     find_last(project_root, |record| record.entry.entry_id == entry_id)
 }
 
-/// The last history record whose entry carried idempotency key `key`.
+/// The last history record whose entry held idempotency key `key`, as its
+/// own key or a later add's.
 pub fn find_history_by_idempotency_key(
     project_root: &Path,
     key: &str,
 ) -> Result<Option<HistoryRecord>> {
     find_last(project_root, |record| {
-        record.entry.idempotency_key.as_deref() == Some(key)
+        record.entry.bound_request_hash(key).is_some()
     })
 }
 

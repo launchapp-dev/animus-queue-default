@@ -5,12 +5,35 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use animus_execution_protocol::RepositoryReservation;
 use animus_queue_default::{
     load_queue_state, save_queue_state, DispatchQueueEntry, DispatchQueueState,
 };
+use animus_queue_protocol::QueueEnqueueV2Request;
 use animus_subject_protocol::{SubjectDispatch, SubjectRef};
 use chrono::Utc;
 use serde_json::{json, Value};
+
+/// The repository/branch reservation used for `task_id` in these tests.
+pub fn reservation(task_id: &str) -> RepositoryReservation {
+    RepositoryReservation {
+        repository: "https://github.com/launchapp-dev/animus-cli.git".to_string(),
+        base_ref: "refs/heads/main".to_string(),
+        head_ref: format!("refs/heads/animus/{task_id}"),
+    }
+}
+
+/// A ticketed add for `task_id`, shaped like the ones in
+/// animus-queue-postgres v0.2.0's tests.
+pub fn enqueue_request(task_id: &str) -> QueueEnqueueV2Request {
+    QueueEnqueueV2Request {
+        subject_dispatch: task_dispatch(task_id, "coding"),
+        idempotency_key: Some(format!("delivery-{task_id}")),
+        repository: Some(reservation(task_id)),
+        run_at: None,
+        expire_after_secs: None,
+    }
+}
 
 /// Load the queue file, apply `edit`, and save it. For setting up states the
 /// public API can't reach directly (expired leases, old files).
