@@ -4,19 +4,27 @@
 //! seven differences listed in the design spec (§7.2). Each one is marked
 //! where it applies.
 
-use animus_execution_protocol::{ExecutionFence, RepositoryReservation, SubjectGeneration};
-use animus_queue_protocol::{
-    FencedQueueEntry, QueueEnqueueV2Request, QueueEnqueueV2Response, QueueLeaseBlock,
-    QueueLeaseBlockReason, QueueLeaseV2Request, QueueLeaseV2Response,
+use animus_execution_protocol::{
+    ExecutionFence, RepositoryReservation, SubjectGeneration, EXECUTION_FENCE_SCHEMA_ID,
+    EXECUTION_FENCE_VERSION,
 };
-use chrono::Utc;
+use animus_queue_protocol::{
+    status, FencedQueueEntry, QueueCompletionV2Request, QueueEnqueueV2Request,
+    QueueEnqueueV2Response, QueueLeaseBlock, QueueLeaseBlockReason, QueueLeaseMutationOutcome,
+    QueueLeaseMutationResponse, QueueLeaseRecoverRequest, QueueLeaseRenewRequest,
+    QueueLeaseV2Request, QueueLeaseV2Response, QueueReleasePendingV2Request,
+};
+use chrono::{Duration, Utc};
 
 use crate::dispatch_queue_state::{
-    DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState, IdempotencyBinding,
+    DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
+    IdempotencyBinding,
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state};
 use crate::identity::{dispatch_canonical_id, dispatch_task_id};
-use crate::queue_history::find_history_by_idempotency_key;
+use crate::queue_history::{
+    find_history_by_entry_id, find_history_by_idempotency_key, HistoryOutcome, HistoryRecord,
+};
 use crate::queue_service::{
     entry_to_protocol, sweep_expired_entries, QueueBackend, QueueCallError,
 };
@@ -317,6 +325,240 @@ impl QueueBackend {
         Ok(QueueLeaseV2Response { leased, blocked })
     }
 
+    /// `queue/v2/lease/renew`: extend a live ticket. The expiry moves to
+    /// `now + ttl` but never earlier than it already is (spec §7.1: the 0.7
+    /// daemon rejects a renewal whose expiry goes backwards). The generation
+    /// stays the same. An expired ticket must be taken over instead.
+    pub fn renew_lease(
+        &self,
+        request: QueueLeaseRenewRequest,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        request.validate().map_err(QueueCallError::InvalidParams)?;
+        let ttl_secs = self.requested_ttl(request.ttl_secs);
+        self.fenced_mutation(&request.execution, FencedOperation::Renew { ttl_secs })
+    }
+
+    /// `queue/v2/lease/recover`: hand an expired ticket to a different owner.
+    /// The lease generation rises by exactly one; the workflow id, workflow
+    /// generation and subject generation stay.
+    pub fn recover_lease(
+        &self,
+        request: QueueLeaseRecoverRequest,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        request.validate().map_err(QueueCallError::InvalidParams)?;
+        let ttl_secs = self.requested_ttl(request.ttl_secs);
+        self.fenced_mutation(
+            &request.execution,
+            FencedOperation::Recover {
+                new_owner_id: request.new_owner_id.trim().to_string(),
+                ttl_secs,
+            },
+        )
+    }
+
+    /// `queue/v2/completion`: finish the ticket's entry and move it to the
+    /// history. Accepted with an expired ticket as long as nobody took the
+    /// task over (difference 1). A repeated "done" is `already_applied` and
+    /// the first outcome is kept.
+    pub fn completion_v2(
+        &self,
+        request: QueueCompletionV2Request,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        request.validate().map_err(QueueCallError::InvalidParams)?;
+        let outcome = HistoryOutcome::from_completion_status(&request.status)
+            .expect("validate() accepts only terminal statuses");
+        self.fenced_mutation(&request.execution, FencedOperation::Complete { outcome })
+    }
+
+    /// `queue/v2/release_pending`: put the ticket's entry back to waiting. It
+    /// keeps its workflow id and ticket fields, so a retry is recognised and
+    /// the next hand-out raises the lease generation. Accepted with an
+    /// expired ticket as long as nobody took the task over (difference 1).
+    pub fn release_pending_v2(
+        &self,
+        request: QueueReleasePendingV2Request,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        request.validate().map_err(QueueCallError::InvalidParams)?;
+        self.fenced_mutation(
+            &request.execution,
+            FencedOperation::ReleasePending {
+                reason: request.reason.trim().to_string(),
+            },
+        )
+    }
+
+    /// A caller's `ttl_secs`, capped at the configured ticket length (v0.2.9).
+    fn requested_ttl(&self, ttl_secs: Option<u64>) -> i64 {
+        let limit = self.lease_ttl_secs();
+        ttl_secs.map_or(limit, |secs| {
+            i64::try_from(secs).unwrap_or(i64::MAX).min(limit)
+        })
+    }
+
+    /// The body shared by the four ticket calls (v0.2.9 `fencedMutation`,
+    /// plus difference 1). Ticket problems are outcomes, not errors.
+    fn fenced_mutation(
+        &self,
+        execution: &ExecutionFence,
+        operation: FencedOperation,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        let entry_id = execution
+            .queue_lease
+            .as_ref()
+            .expect("validate_queue_backed() requires queue_lease")
+            .entry_id
+            .clone();
+        let _lock = acquire_queue_lock(self.project_root())?;
+        let mut state = load_queue_state(self.project_root())?.unwrap_or_default();
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == entry_id)
+        else {
+            return self.finished_entry_outcome(&entry_id, execution, &operation);
+        };
+
+        let now = Utc::now();
+        let entry = &mut state.entries[index];
+        if matches!(operation, FencedOperation::ReleasePending { .. })
+            && entry.status == DispatchQueueEntryStatus::Pending
+            && exact_fence_matches(entry, execution)
+        {
+            return Ok(mutation_response(
+                QueueLeaseMutationOutcome::AlreadyApplied,
+                None,
+                None,
+            ));
+        }
+        if entry.status != DispatchQueueEntryStatus::Assigned {
+            return Ok(mutation_response(
+                QueueLeaseMutationOutcome::NotAssigned,
+                None,
+                Some(format!("queue entry is {}", entry.status.as_wire())),
+            ));
+        }
+        if !exact_fence_matches(entry, execution) {
+            return Ok(mutation_response(
+                QueueLeaseMutationOutcome::StaleFence,
+                None,
+                Some("execution fence does not own this queue lease".to_string()),
+            ));
+        }
+
+        match operation {
+            FencedOperation::Recover {
+                new_owner_id,
+                ttl_secs,
+            } => {
+                if new_owner_id.is_empty()
+                    || entry.lease_owner.as_deref() == Some(new_owner_id.as_str())
+                {
+                    return Err(QueueCallError::InvalidParams(
+                        "lease recovery requires a different non-empty owner".to_string(),
+                    ));
+                }
+                if entry.lease_is_live(now) {
+                    return Ok(mutation_response(
+                        QueueLeaseMutationOutcome::LeaseStillLive,
+                        entry.execution_fence(),
+                        None,
+                    ));
+                }
+                entry.lease_owner = Some(new_owner_id);
+                entry.lease_generation += 1;
+                entry.lease_expires_at = Some(now + Duration::seconds(ttl_secs));
+                let fence = entry.execution_fence();
+                self.commit(&state, &[])?;
+                Ok(mutation_response(
+                    QueueLeaseMutationOutcome::Applied,
+                    fence,
+                    None,
+                ))
+            }
+            FencedOperation::Renew { ttl_secs } => {
+                if !entry.lease_is_live(now) {
+                    return Ok(mutation_response(
+                        QueueLeaseMutationOutcome::StaleFence,
+                        None,
+                        Some("queue lease has expired and requires recovery".to_string()),
+                    ));
+                }
+                let renewed = now + Duration::seconds(ttl_secs);
+                entry.lease_expires_at = entry.lease_expires_at.max(Some(renewed));
+                let fence = entry.execution_fence();
+                self.commit(&state, &[])?;
+                Ok(mutation_response(
+                    QueueLeaseMutationOutcome::Applied,
+                    fence,
+                    None,
+                ))
+            }
+            // Difference 1: no expiry check. The exact match above already
+            // proves nobody took the task over.
+            FencedOperation::Complete { outcome } => {
+                let done = state.entries.remove(index);
+                let fence = done.execution_fence();
+                let record = HistoryRecord::finished(&done, outcome, "queue/v2/completion", None);
+                self.commit(&state, &[record])?;
+                Ok(mutation_response(
+                    QueueLeaseMutationOutcome::Applied,
+                    fence,
+                    None,
+                ))
+            }
+            FencedOperation::ReleasePending { reason } => {
+                entry.status = DispatchQueueEntryStatus::Pending;
+                entry.assigned_at = None;
+                entry.audit_log.push(DispatchQueueAuditEntry {
+                    at: now.to_rfc3339(),
+                    method: "queue/v2/release_pending".to_string(),
+                    from_status: status::ASSIGNED.to_string(),
+                    to_status: status::PENDING.to_string(),
+                    reason,
+                });
+                self.commit(&state, &[])?;
+                Ok(mutation_response(
+                    QueueLeaseMutationOutcome::Applied,
+                    None,
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// The outcome for an entry that is no longer live. v0.2.9 keeps
+    /// finished rows and answers from them; this queue answers from the
+    /// history, taking the first record for the entry.
+    fn finished_entry_outcome(
+        &self,
+        entry_id: &str,
+        execution: &ExecutionFence,
+        operation: &FencedOperation,
+    ) -> Result<QueueLeaseMutationResponse, QueueCallError> {
+        let Some(record) = find_history_by_entry_id(self.project_root(), entry_id)? else {
+            return Ok(mutation_response(
+                QueueLeaseMutationOutcome::NotFound,
+                None,
+                None,
+            ));
+        };
+        if matches!(operation, FencedOperation::Complete { .. })
+            && record.outcome != HistoryOutcome::Dropped
+            && exact_fence_matches(&record.entry, execution)
+        {
+            return Ok(mutation_response(
+                QueueLeaseMutationOutcome::AlreadyApplied,
+                record.entry.execution_fence(),
+                None,
+            ));
+        }
+        Ok(mutation_response(
+            QueueLeaseMutationOutcome::NotAssigned,
+            None,
+            Some(format!("queue entry is {}", record.outcome.state_word())),
+        ))
+    }
+
     /// The original receipt for `key`, from the live file or, if the entry
     /// already finished, from the history. `swept` holds entries this call's
     /// expiry sweep just removed, which aren't in the history file yet (v0.2.9
@@ -371,6 +613,62 @@ impl QueueBackend {
             },
             warning: None,
         }))
+    }
+}
+
+/// One of the four ticket calls, with its validated inputs.
+enum FencedOperation {
+    Renew { ttl_secs: i64 },
+    Recover { new_owner_id: String, ttl_secs: i64 },
+    Complete { outcome: HistoryOutcome },
+    ReleasePending { reason: String },
+}
+
+fn mutation_response(
+    outcome: QueueLeaseMutationOutcome,
+    execution: Option<ExecutionFence>,
+    reason: Option<String>,
+) -> QueueLeaseMutationResponse {
+    QueueLeaseMutationResponse {
+        outcome,
+        execution,
+        reason,
+    }
+}
+
+/// `true` when `execution` is the entry's current ticket (v0.2.9
+/// `exactFenceMatches`). Matches the owner and every id and generation, and
+/// the repository, but not the expiry time.
+fn exact_fence_matches(entry: &DispatchQueueEntry, execution: &ExecutionFence) -> bool {
+    let (Some(subject), Some(lease)) = (&execution.subject, &execution.queue_lease) else {
+        return false;
+    };
+    execution.schema == EXECUTION_FENCE_SCHEMA_ID
+        && execution.version == EXECUTION_FENCE_VERSION
+        && entry.workflow_id.as_deref() == Some(execution.workflow_id.as_str())
+        && entry.workflow_generation == Some(execution.workflow_generation)
+        && entry.subject_id.as_deref() == Some(subject.qualified_id.as_str())
+        && entry.subject_generation == Some(subject.generation)
+        && entry.entry_id == lease.entry_id
+        && entry.lease_owner.as_deref() == Some(lease.owner_id.as_str())
+        && entry.lease_generation == lease.generation
+        && same_repository(execution.repository.as_ref(), entry.repository.as_ref())
+}
+
+/// v0.2.9 `sameRepository`: both absent, or the same repository (ignoring
+/// case) with the same base and head refs.
+fn same_repository(
+    left: Option<&RepositoryReservation>,
+    right: Option<&RepositoryReservation>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.repository.to_lowercase() == right.repository.to_lowercase()
+                && left.base_ref == right.base_ref
+                && left.head_ref == right.head_ref
+        }
+        _ => false,
     }
 }
 
