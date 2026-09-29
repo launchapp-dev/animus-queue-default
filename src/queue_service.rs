@@ -19,11 +19,13 @@ use crate::dispatch_queue_state::{
     DispatchQueueAuditEntry, DispatchQueueEntry, DispatchQueueEntryStatus, DispatchQueueState,
 };
 use crate::dispatch_queue_store::{acquire_queue_lock, load_queue_state, save_queue_state};
+use crate::lease_ttl::DEFAULT_LEASE_TTL_SECS;
 
 /// File-locked backend wrapping a single project root's queue state.
 #[derive(Debug, Clone)]
 pub struct QueueBackend {
     project_root: PathBuf,
+    lease_ttl_secs: i64,
 }
 
 /// Result of a single enqueue.
@@ -44,12 +46,27 @@ impl QueueBackend {
     /// Bind the backend to a project root. State / lock files live under
     /// `<project_root>/.animus/`.
     pub fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+        Self {
+            project_root,
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
+        }
+    }
+
+    /// Use `secs` as the lease (ticket) length instead of the default.
+    /// Callers pass a value from [`crate::lease_ttl::parse_lease_ttl`].
+    pub fn with_lease_ttl(mut self, secs: i64) -> Self {
+        self.lease_ttl_secs = secs;
+        self
     }
 
     /// Bound project root.
     pub fn project_root(&self) -> &Path {
         &self.project_root
+    }
+
+    /// Lease (ticket) length in seconds.
+    pub fn lease_ttl_secs(&self) -> i64 {
+        self.lease_ttl_secs
     }
 
     // ============================================================

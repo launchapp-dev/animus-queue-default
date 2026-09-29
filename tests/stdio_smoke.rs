@@ -33,6 +33,14 @@ fn manifest_prints_valid_json() {
         .expect("capabilities array");
     assert!(methods.iter().any(|v| v == "queue/lease"));
     assert!(methods.iter().any(|v| v == "queue/enqueue"));
+
+    // The host forwards only declared variables, so the ticket-length
+    // setting must be declared to reach the plugin.
+    let env = manifest["env_required"].as_array().expect("env_required");
+    assert_eq!(env.len(), 1);
+    assert_eq!(env[0]["name"], "ANIMUS_QUEUE_LEASE_TTL_SECS");
+    assert_eq!(env[0]["required"], false);
+    assert_eq!(env[0]["sensitive"], false);
 }
 
 #[test]
