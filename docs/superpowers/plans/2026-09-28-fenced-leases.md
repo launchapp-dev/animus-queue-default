@@ -8439,7 +8439,7 @@ These are runtime state. Add them to your `.gitignore`:
 - **No change stream.** Poll `queue/list`.
 - **One project root per process.** Re-binding needs a restart.
 - **No Windows build.**
-- **A task can stay "running" if a hand-out reply is lost.** The queue records the hand-out, and then the queue process is killed, or the daemon crashes before saving the ticket. The daemon never learns the ticket, so it can't renew or take over the task. `animus-postgres` has the same gap. The fix belongs in the daemon. Until then, find the task with `animus queue list` (status `assigned`, with no run for it in `animus status`). Remove it with `animus queue drop <task-id>`, which drops every queue entry for that task, then add it again with `animus queue enqueue --task-id <task-id>`.
+- **A task can stay "running" if a hand-out reply is lost.** The queue records the hand-out, and then the queue process is killed, or the daemon crashes before saving the ticket. The daemon never learns the ticket, so it can't renew or take over the task. `animus-postgres` has the same gap. The fix belongs in the daemon. Until then, find the task with `animus queue list` (status `assigned`, with no run for it in `animus status`). Remove it with `animus queue drop <task-id>`, which drops every queue entry for that task, then add it again with `animus queue enqueue --subject-id <task-id>`.
 
 ## Build
 
@@ -8518,7 +8518,7 @@ These match v0.2.9 on purpose:
 
 ## Known gap
 
-As with `animus-postgres`, a task can stay "running" if the queue records a hand-out and the reply never reaches the daemon (the queue process is killed, or the daemon crashes before saving the ticket). The daemon can't renew or take over a ticket it never received. Until the daemon handles this, remove it with `animus queue drop <task-id>` (this drops every queue entry for that task) and add it again with `animus queue enqueue --task-id <task-id>`.
+As with `animus-postgres`, a task can stay "running" if the queue records a hand-out and the reply never reaches the daemon (the queue process is killed, or the daemon crashes before saving the ticket). The daemon can't renew or take over a ticket it never received. Until the daemon handles this, remove it with `animus queue drop <task-id>` (this drops every queue entry for that task) and add it again with `animus queue enqueue --subject-id <task-id>`.
 ```
 
 Replace the whole of `src/lib.rs` with:
@@ -8710,7 +8710,7 @@ PY
 
 ```bash
 "$ANIMUS" subject create --kind task --title "e2e one" --project-root "$P"      # note the TASK id
-"$ANIMUS" queue enqueue --task-id <TASK-ID> --workflow-ref e2e-short --project-root "$P"
+"$ANIMUS" queue enqueue --subject-id <TASK-ID> --workflow-ref e2e-short --project-root "$P"
 "$ANIMUS" daemon start --project-root "$P"
 "$ANIMUS" queue list --project-root "$P"
 show; cat "$P/.animus/queue.json"
@@ -8722,7 +8722,7 @@ Expected:
 - One `completed` line appears in `queue-history.jsonl`.
 - `animus daemon stream --pretty` shows no queue errors.
 
-If the CLI's enqueue flags differ, load `animus-queue-management` before retrying.
+The 0.7 CLI takes `--subject-id` (a bare `TASK-…` id or `task:TASK-…`); `--task-id` is gone. If the flags differ again, load `animus-queue-management` before retrying.
 
 - [ ] **Step 5: The hard cases**
 
@@ -8739,7 +8739,25 @@ Run each case and write down what happened for the PR description:
    - About 60 seconds in, run `show` and note each entry's expiry: it must already be in the past. With every slot busy the daemon doesn't renew, which is the case difference 1 exists for. If the expiries are still in the future, the case isn't being exercised: stop and find out why.
    - After both runs end, `show` must list both as `completed`, each with `finished` later than its `ticket expiry`. `daemon stream` shows no `stale_fence`, and nothing is left `assigned`.
 
+Then build the queue file Step 7 needs, still in this test home. Stop the daemon first, so nothing is handed out while you set it up:
+
+```bash
+"$ANIMUS" daemon stop --project-root "$P"
+"$ANIMUS" daemon status --project-root "$P"      # must say the daemon is not running
+"$ANIMUS" subject create --kind task --title "rollback waiting" --project-root "$P"   # note the TASK id
+"$ANIMUS" subject create --kind task --title "rollback held" --project-root "$P"      # note the TASK id
+"$ANIMUS" queue enqueue --subject-id <WAITING-ID> --workflow-ref e2e-short --project-root "$P"
+"$ANIMUS" queue enqueue --subject-id <HELD-ID> --workflow-ref e2e-short --project-root "$P"
+"$ANIMUS" queue hold <HELD-ID> --project-root "$P"     # hold takes the task id
+show
+cp "$P/.animus/queue.json" "$E2E/rollback-queue.json"
+```
+
+Expected: `show` lists one `pending` and one `held` entry. The daemon stays stopped from here on.
+
 - [ ] **Step 6: Old CLI refused (installed 0.6.33, isolated HOME)**
+
+This step and Step 7 use a second test home, so the old CLI doesn't see the new CLI's plugins. Don't run `"$ANIMUS"` here: in this home it would find the old plugins. If you need it, put `HOME="$E2E/home"` in front of the command.
 
 ```bash
 export HOME=$E2E/old-home && mkdir -p "$HOME"
@@ -8768,16 +8786,24 @@ Expected: the list works again. Use the exact working command in the README and 
 
 - [ ] **Step 7: Rollback with the real 0.6.33**
 
-Copy a `queue.json` written by v0.4.0 in Steps 4–5 (with a held entry: enqueue a task and run `"$ANIMUS" queue hold <TASK-ID> --project-root "$P"` first; hold takes the task id) into `$Q/.animus/`, then run `"$OLD" queue list --project-root "$Q"`.
+Still in the old test home, with queue v0.3.3 installed at the end of Step 6. Put the file v0.4.0 wrote at the end of Step 5 in place and list it with the old CLI:
 
-Expected: waiting and held entries are listed with their statuses.
+```bash
+echo $HOME                                                   # must be $E2E/old-home
+cp "$E2E/rollback-queue.json" "$Q/.animus/queue.json"
+"$OLD" queue list --project-root "$Q"
+```
+
+Expected: both entries are listed, one `pending` and one `held`.
 
 - [ ] **Step 8: Final gates**
 
 Leave the isolated environment first: git, cargo and `gh` read their settings from the real home.
 
 ```bash
-"$ANIMUS" daemon stop --project-root "$P" 2>/dev/null
+# Safety net: each daemon is stopped with the home it was started in.
+HOME="$E2E/home" "$ANIMUS" daemon stop --project-root "$P" 2>/dev/null
+HOME="$E2E/old-home" "$OLD" daemon stop --project-root "$Q" 2>/dev/null
 export HOME="$REAL_HOME" && cd "$QUEUE_REPO"
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all-features && cargo build --release
 git status --short   # must be empty
