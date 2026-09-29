@@ -120,7 +120,7 @@ impl DispatchQueueEntry {
     ) -> Self {
         Self {
             entry_id: uuid::Uuid::new_v4().to_string(),
-            subject_id: Some(dispatch.subject_key()),
+            subject_id: dispatch.subject_key(),
             task_id: dispatch.task_id().unwrap_or_default().to_string(),
             dispatch: Some(dispatch),
             status: DispatchQueueEntryStatus::Pending,
@@ -182,8 +182,8 @@ impl DispatchQueueEntry {
         {
             return subject_id;
         }
-        if let Some(dispatch) = &self.dispatch {
-            return dispatch.subject_id();
+        if let Some(subject_id) = self.dispatch.as_ref().and_then(SubjectDispatch::subject_id) {
+            return subject_id;
         }
         self.task_id.as_str()
     }

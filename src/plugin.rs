@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::queue_service::{QueueBackend, QueueLeaseError, QueueReleasePendingError};
+use crate::queue_service::{
+    QueueBackend, QueueCallError, QueueLeaseError, QueueReleasePendingError,
+};
 
 const PLUGIN_NAME: &str = "animus-queue-default";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -143,6 +145,8 @@ fn print_manifest() {
         capabilities: queue_methods().into_iter().map(|m| m.to_string()).collect(),
         env_required: Vec::new(),
         notification_buffer_size: None,
+        plugin_kinds: Vec::new(),
+        supports_mcp: None,
     };
     let mut stdout = io::stdout().lock();
     let _ = writeln!(
@@ -272,6 +276,7 @@ async fn handle_initialize(
         // Hosts clamp `queue/lease.max` to this value; advertising `u32::MAX`
         // is the "effectively unlimited" sentinel for the reference plugin.
         max_lease_batch: u32::MAX,
+        generation_fenced_leases_v1: false,
     };
     let extra = serde_json::to_value(capabilities).unwrap_or(Value::Null);
     let mut kind_capabilities = std::collections::HashMap::new();
@@ -289,6 +294,7 @@ async fn handle_initialize(
             name: PLUGIN_NAME.to_string(),
             version: PLUGIN_VERSION.to_string(),
             plugin_kind: PLUGIN_KIND_QUEUE.to_string(),
+            plugin_kinds: Vec::new(),
             description: Some(PLUGIN_DESCRIPTION.to_string()),
         },
         capabilities: PluginCapabilities {
@@ -370,7 +376,7 @@ async fn handle_enqueue(
                 warning: outcome.warning,
             },
         ),
-        Err(error) => internal_error_response(id, format!("queue/enqueue failed: {error:#}")),
+        Err(error) => call_error_response(id, error, "queue/enqueue"),
     }
 }
 
@@ -730,6 +736,15 @@ fn not_pending_or_internal(id: Option<Value>, error: &anyhow::Error, method: &st
         );
     }
     internal_error_response(id, format!("{method} failed: {error:#}"))
+}
+
+fn call_error_response(id: Option<Value>, error: QueueCallError, method: &str) -> RpcResponse {
+    match error {
+        QueueCallError::InvalidParams(message) => RpcResponse::err(id, invalid_params(message)),
+        QueueCallError::Backend(error) => {
+            internal_error_response(id, format!("{method} failed: {error:#}"))
+        }
+    }
 }
 
 fn invalid_params(message: impl Into<String>) -> RpcError {
