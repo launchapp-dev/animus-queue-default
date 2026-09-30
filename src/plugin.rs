@@ -1,16 +1,17 @@
 //! Stdio JSON-RPC loop for the `animus-queue-default` plugin.
 //!
 //! Handles `initialize`, `$/ping`, `health/check`, `shutdown`, `exit`,
-//! `--manifest` / `--help` CLI shortcuts, and the 10 `queue/*` methods.
+//! `--manifest` / `--help` CLI shortcuts, the old-style `queue/*` methods and
+//! the six ticketed `queue/v2/*` methods.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use animus_plugin_protocol::{
-    error_codes as plugin_error_codes, HealthCheckResult, HealthStatus, InitializeParams,
-    InitializeResult, KindCapability, PluginCapabilities, PluginInfo, PluginManifest, RpcError,
-    RpcRequest, RpcResponse, PLUGIN_KIND_QUEUE, PROTOCOL_VERSION,
+    error_codes as plugin_error_codes, EnvRequirement, HealthCheckResult, HealthStatus,
+    InitializeParams, InitializeResult, KindCapability, PluginCapabilities, PluginInfo,
+    PluginManifest, RpcError, RpcRequest, RpcResponse, PLUGIN_KIND_QUEUE, PROTOCOL_VERSION,
 };
 use animus_queue_protocol::{
     error_codes as queue_error_codes, QueueCapabilities, QueueCompletionRequest, QueueDropRequest,
@@ -18,20 +19,29 @@ use animus_queue_protocol::{
     QueueListRequest, QueueMarkAssignedRequest, QueueReleasePendingParams, QueueReleaseRequest,
     QueueReorderRequest, KIND, METHOD_QUEUE_COMPLETION, METHOD_QUEUE_DROP, METHOD_QUEUE_ENQUEUE,
     METHOD_QUEUE_HOLD, METHOD_QUEUE_LEASE, METHOD_QUEUE_LIST, METHOD_QUEUE_MARK_ASSIGNED,
-    METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING, METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS,
-    PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
+    METHOD_QUEUE_NEXT_DEADLINE, METHOD_QUEUE_RELEASE, METHOD_QUEUE_RELEASE_PENDING,
+    METHOD_QUEUE_REORDER, METHOD_QUEUE_STATS, PROTOCOL_VERSION as QUEUE_PROTOCOL_VERSION,
+};
+use animus_queue_protocol::{
+    METHOD_QUEUE_COMPLETION_V2, METHOD_QUEUE_ENQUEUE_V2, METHOD_QUEUE_LEASE_RECOVER,
+    METHOD_QUEUE_LEASE_RENEW, METHOD_QUEUE_LEASE_V2, METHOD_QUEUE_RELEASE_PENDING_V2,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::queue_service::{QueueBackend, QueueLeaseError, QueueReleasePendingError};
+use crate::fenced_queue::MAX_LEASE_BATCH;
+use crate::host_guard::check_host;
+use crate::lease_ttl::{lease_ttl_from_env, LEASE_TTL_ENV};
+use crate::queue_service::{
+    QueueBackend, QueueCallError, QueueLeaseError, QueueMutationError, QueueReleasePendingError,
+};
 
 const PLUGIN_NAME: &str = "animus-queue-default";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PLUGIN_DESCRIPTION: &str =
-    "Reference queue plugin for Animus v0.5 (file-backed dispatch queue with atomic lease).";
+    "Reference queue plugin for Animus 0.7 (file-backed dispatch queue with generation-fenced leases).";
 
 /// Stable entrypoint for the plugin process. Call from `#[tokio::main]` in
 /// `main.rs`.
@@ -141,8 +151,17 @@ fn print_manifest() {
         description: PLUGIN_DESCRIPTION.to_string(),
         protocol_version: PROTOCOL_VERSION.to_string(),
         capabilities: queue_methods().into_iter().map(|m| m.to_string()).collect(),
-        env_required: Vec::new(),
+        env_required: vec![EnvRequirement {
+            name: LEASE_TTL_ENV.to_string(),
+            description: Some(
+                "Queue lease (ticket) length in seconds, 1-604800. Default 1800.".to_string(),
+            ),
+            sensitive: false,
+            required: false,
+        }],
         notification_buffer_size: None,
+        plugin_kinds: Vec::new(),
+        supports_mcp: None,
     };
     let mut stdout = io::stdout().lock();
     let _ = writeln!(
@@ -159,6 +178,7 @@ fn queue_methods() -> Vec<&'static str> {
         METHOD_QUEUE_LIST,
         METHOD_QUEUE_LEASE,
         METHOD_QUEUE_STATS,
+        METHOD_QUEUE_NEXT_DEADLINE,
         METHOD_QUEUE_HOLD,
         METHOD_QUEUE_RELEASE,
         METHOD_QUEUE_RELEASE_PENDING,
@@ -166,6 +186,12 @@ fn queue_methods() -> Vec<&'static str> {
         METHOD_QUEUE_REORDER,
         METHOD_QUEUE_MARK_ASSIGNED,
         METHOD_QUEUE_COMPLETION,
+        METHOD_QUEUE_ENQUEUE_V2,
+        METHOD_QUEUE_LEASE_V2,
+        METHOD_QUEUE_LEASE_RENEW,
+        METHOD_QUEUE_LEASE_RECOVER,
+        METHOD_QUEUE_COMPLETION_V2,
+        METHOD_QUEUE_RELEASE_PENDING_V2,
         "health/check",
     ]
 }
@@ -188,6 +214,7 @@ async fn handle_request(
         METHOD_QUEUE_LIST => Some(handle_list(id, request.params, &backend).await),
         METHOD_QUEUE_LEASE => Some(handle_lease(id, request.params, &backend).await),
         METHOD_QUEUE_STATS => Some(handle_stats(id, &backend).await),
+        METHOD_QUEUE_NEXT_DEADLINE => Some(handle_next_deadline(id, &backend).await),
         METHOD_QUEUE_HOLD => Some(handle_hold(id, request.params, &backend).await),
         METHOD_QUEUE_RELEASE => Some(handle_release(id, request.params, &backend).await),
         METHOD_QUEUE_RELEASE_PENDING => {
@@ -199,6 +226,66 @@ async fn handle_request(
             Some(handle_mark_assigned(id, request.params, &backend).await)
         }
         METHOD_QUEUE_COMPLETION => Some(handle_completion(id, request.params, &backend).await),
+        METHOD_QUEUE_ENQUEUE_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_ENQUEUE_V2,
+                QueueBackend::enqueue_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_V2,
+                QueueBackend::lease_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_RENEW => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_RENEW,
+                QueueBackend::renew_lease,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_LEASE_RECOVER => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_LEASE_RECOVER,
+                QueueBackend::recover_lease,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_COMPLETION_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_COMPLETION_V2,
+                QueueBackend::completion_v2,
+            )
+            .await,
+        ),
+        METHOD_QUEUE_RELEASE_PENDING_V2 => Some(
+            handle_v2(
+                id,
+                request.params,
+                &backend,
+                METHOD_QUEUE_RELEASE_PENDING_V2,
+                QueueBackend::release_pending_v2,
+            )
+            .await,
+        ),
         other => Some(RpcResponse::err(
             id,
             RpcError {
@@ -246,14 +333,27 @@ async fn handle_initialize(
     params: Option<Value>,
     backend: &Arc<RwLock<Option<QueueBackend>>>,
 ) -> RpcResponse {
-    let init: InitializeParams = match params
-        .ok_or_else(|| invalid_params("missing params for initialize"))
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| invalid_params(format!("invalid initialize params: {error}")))
-        }) {
+    let Some(params) = params else {
+        return RpcResponse::err(id, invalid_params("missing params for initialize"));
+    };
+    // Refuse 0.6.x and older hosts first, before the project binding is even
+    // read, so a refused host never reaches the queue files.
+    let host_protocol = params.get("protocol_version").and_then(Value::as_str);
+    let host_version = params
+        .get("host_info")
+        .and_then(|host_info| host_info.get("version"))
+        .and_then(Value::as_str);
+    if let Err(error) = check_host(host_protocol, host_version) {
+        return RpcResponse::err(id, error);
+    }
+    let init: InitializeParams = match serde_json::from_value(params) {
         Ok(value) => value,
-        Err(error) => return RpcResponse::err(id, error),
+        Err(error) => {
+            return RpcResponse::err(
+                id,
+                invalid_params(format!("invalid initialize params: {error}")),
+            );
+        }
     };
 
     let project_root = match extract_project_root(&init) {
@@ -261,15 +361,15 @@ async fn handle_initialize(
         Err(error) => return RpcResponse::err(id, error),
     };
 
-    *backend.write().await = Some(QueueBackend::new(project_root));
+    *backend.write().await =
+        Some(QueueBackend::new(project_root).with_lease_ttl(lease_ttl_from_env()));
 
+    // Identical to animus-postgres v0.2.9 and animus-queue-postgres v0.2.0.
+    // The 0.7 daemon requires the flag and a batch of at least 5.
     let capabilities = QueueCapabilities {
         priority_weighted: false,
-        // No backend-side cap on lease batch size — file-locked state happily
-        // handles batches of any size the daemon's capacity budgeter requests.
-        // Hosts clamp `queue/lease.max` to this value; advertising `u32::MAX`
-        // is the "effectively unlimited" sentinel for the reference plugin.
-        max_lease_batch: u32::MAX,
+        max_lease_batch: MAX_LEASE_BATCH as u32,
+        generation_fenced_leases_v1: true,
     };
     let extra = serde_json::to_value(capabilities).unwrap_or(Value::Null);
     let mut kind_capabilities = std::collections::HashMap::new();
@@ -287,6 +387,7 @@ async fn handle_initialize(
             name: PLUGIN_NAME.to_string(),
             version: PLUGIN_VERSION.to_string(),
             plugin_kind: PLUGIN_KIND_QUEUE.to_string(),
+            plugin_kinds: Vec::new(),
             description: Some(PLUGIN_DESCRIPTION.to_string()),
         },
         capabilities: PluginCapabilities {
@@ -354,16 +455,21 @@ async fn handle_enqueue(
         Err(response) => return response,
     };
 
-    match backend.enqueue(request.subject_dispatch) {
+    match backend.enqueue(
+        request.subject_dispatch,
+        request.run_at,
+        request.expire_after_secs,
+    ) {
         Ok(outcome) => to_value_response(
             id,
             &QueueEnqueueResponse {
                 enqueued: outcome.enqueued,
                 entry_id: outcome.entry_id,
                 subject_id: outcome.subject_id,
+                warning: outcome.warning,
             },
         ),
-        Err(error) => internal_error_response(id, format!("queue/enqueue failed: {error:#}")),
+        Err(error) => call_error_response(id, error, "queue/enqueue"),
     }
 }
 
@@ -419,7 +525,10 @@ async fn handle_lease(
         Err(response) => return response,
     };
 
-    match backend.lease(request.max, request.workflow_ids) {
+    let exclude_subjects = request
+        .exclude_subjects
+        .map(|ids| ids.into_iter().map(|id| id.0).collect::<Vec<String>>());
+    match backend.lease(request.max, request.workflow_ids, exclude_subjects) {
         Ok(response) => to_value_response(id, &response),
         Err(QueueLeaseError::WorkflowIdCountMismatch { expected, actual }) => RpcResponse::err(
             id,
@@ -454,6 +563,24 @@ async fn handle_stats(
 }
 
 // ============================================================
+// queue/next_deadline
+// ============================================================
+
+async fn handle_next_deadline(
+    id: Option<Value>,
+    backend: &Arc<RwLock<Option<QueueBackend>>>,
+) -> RpcResponse {
+    let backend = match require_backend(id.clone(), backend).await {
+        Ok(b) => b,
+        Err(response) => return response,
+    };
+    match backend.next_deadline() {
+        Ok(resp) => to_value_response(id, &resp),
+        Err(error) => internal_error_response(id, format!("queue/next_deadline failed: {error:#}")),
+    }
+}
+
+// ============================================================
 // queue/hold + queue/release + queue/drop + queue/reorder
 // + queue/mark_assigned + queue/completion
 // ============================================================
@@ -473,7 +600,7 @@ async fn handle_hold(
     };
     match backend.hold(&request.entry_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/hold"),
+        Err(error) => mutation_error_response(id, error, "queue/hold"),
     }
 }
 
@@ -492,7 +619,7 @@ async fn handle_release(
     };
     match backend.release(&request.entry_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/release"),
+        Err(error) => mutation_error_response(id, error, "queue/release"),
     }
 }
 
@@ -521,6 +648,14 @@ async fn handle_release_pending(
             RpcError {
                 code: plugin_error_codes::INVALID_PARAMS,
                 message: format!("entry_id not found: {entry_id}"),
+                data: None,
+            },
+        ),
+        Err(error @ QueueReleasePendingError::Fenced { .. }) => RpcResponse::err(
+            id,
+            RpcError {
+                code: queue_error_codes::QUEUE_STALE_FENCE,
+                message: error.to_string(),
                 data: None,
             },
         ),
@@ -604,7 +739,7 @@ async fn handle_mark_assigned(
         };
     match backend.mark_assigned(&request.entry_id, request.workflow_id) {
         Ok(response) => to_value_response(id, &response),
-        Err(error) => not_pending_or_internal(id, &error, "queue/mark_assigned"),
+        Err(error) => mutation_error_response(id, error, "queue/mark_assigned"),
     }
 }
 
@@ -637,6 +772,38 @@ async fn handle_completion(
                 data: None,
             },
         ),
+    }
+}
+
+// ============================================================
+// queue/v2/*
+// ============================================================
+
+/// Shared handler for the ticketed methods. Params are the protocol's strict
+/// request types (unknown fields are rejected); bad input is `-32602`, and
+/// ticket problems come back as normal outcomes inside the result.
+async fn handle_v2<Req, Resp>(
+    id: Option<Value>,
+    params: Option<Value>,
+    backend: &Arc<RwLock<Option<QueueBackend>>>,
+    method: &str,
+    call: fn(&QueueBackend, Req) -> std::result::Result<Resp, QueueCallError>,
+) -> RpcResponse
+where
+    Req: serde::de::DeserializeOwned,
+    Resp: serde::Serialize,
+{
+    let backend = match require_backend(id.clone(), backend).await {
+        Ok(b) => b,
+        Err(response) => return response,
+    };
+    let request: Req = match parse_params(id.clone(), params, method) {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    match call(&backend, request) {
+        Ok(response) => to_value_response(id, &response),
+        Err(error) => call_error_response(id, error, method),
     }
 }
 
@@ -689,19 +856,35 @@ fn to_value_response<T: serde::Serialize>(id: Option<Value>, value: &T) -> RpcRe
     }
 }
 
-fn not_pending_or_internal(id: Option<Value>, error: &anyhow::Error, method: &str) -> RpcResponse {
-    let msg = error.to_string();
-    if msg.contains("not in the expected pre-mutation status") {
-        return RpcResponse::err(
-            id,
-            RpcError {
-                code: queue_error_codes::QUEUE_ENTRY_NOT_PENDING,
-                message: msg,
-                data: None,
-            },
-        );
+fn mutation_error_response(
+    id: Option<Value>,
+    error: QueueMutationError,
+    method: &str,
+) -> RpcResponse {
+    let code = match &error {
+        QueueMutationError::NotPending { .. } => queue_error_codes::QUEUE_ENTRY_NOT_PENDING,
+        QueueMutationError::Fenced { .. } => queue_error_codes::QUEUE_STALE_FENCE,
+        QueueMutationError::Backend(error) => {
+            return internal_error_response(id, format!("{method} failed: {error:#}"));
+        }
+    };
+    RpcResponse::err(
+        id,
+        RpcError {
+            code,
+            message: error.to_string(),
+            data: None,
+        },
+    )
+}
+
+fn call_error_response(id: Option<Value>, error: QueueCallError, method: &str) -> RpcResponse {
+    match error {
+        QueueCallError::InvalidParams(message) => RpcResponse::err(id, invalid_params(message)),
+        QueueCallError::Backend(error) => {
+            internal_error_response(id, format!("{method} failed: {error:#}"))
+        }
     }
-    internal_error_response(id, format!("{method} failed: {error:#}"))
 }
 
 fn invalid_params(message: impl Into<String>) -> RpcError {
